@@ -159,6 +159,39 @@ class TableConfig:
                     f"{path}: unknown layer3 strategy {strategy!r};"
                     f" must be one of {sorted(LAYER3_STRATEGIES)}"
                 )
+            if strategy == "scd2_apply":
+                # scd2_apply's Python side (layer3_warehouse.scd2_apply) calls
+                # warehouse.apply_cdc_event() with a hardcoded column list
+                # (client_id, lsn, commit_ts, op, after) and a hardcoded
+                # target table — previously neither was checked against the
+                # config, so a typo'd/incomplete expected_columns silently
+                # NULLs the dimension on every apply (no exception, no
+                # quarantine row, watermark still advances), and a
+                # misconfigured `target` was simply ignored. Fail loud here
+                # instead (Step 6 dual review finding, Opus).
+                _REQUIRED = {"client_id", "lsn", "commit_ts", "op", "after"}
+                missing = _REQUIRED - set(entry.get("columns") or []) - set(source.expected_columns)
+                if missing:
+                    raise ValueError(
+                        f"{path}: layer3 strategy scd2_apply requires source.expected_columns"
+                        f" to include {sorted(_REQUIRED)}; missing {sorted(missing)}"
+                    )
+                if entry.get("target") != "warehouse.dim_client_risk_snapshot":
+                    raise ValueError(
+                        f"{path}: layer3 strategy scd2_apply always writes to"
+                        f" warehouse.dim_client_risk_snapshot (via apply_cdc_event) —"
+                        f" target={entry.get('target')!r} would be silently ignored"
+                    )
+                if not raw.get("orchestration", {}).get("requires_scd2_baseline"):
+                    # Without this, a typo'd/omitted requires_scd2_baseline
+                    # silently drops the wait_for_scd2_baseline sensor and
+                    # reintroduces the ADR-2 baseline-ordering race with no
+                    # test catching it (test_dag_factory.py only asserts the
+                    # sensor exists when the key is spelled right).
+                    raise ValueError(
+                        f"{path}: layer3 strategy scd2_apply requires"
+                        f" orchestration.requires_scd2_baseline: true"
+                    )
             if strategy == "scd2_baseline_seed" and not entry.get("cdc_source_glob"):
                 # Without this, a misspelled/omitted key silently seeds a
                 # fabricated baseline for an insert-first client (e.g. CL030)

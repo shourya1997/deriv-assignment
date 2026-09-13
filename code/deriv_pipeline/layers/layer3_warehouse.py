@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
+from psycopg.types.json import Jsonb
+
 from deriv_pipeline.config import TableConfig
 from deriv_pipeline.dims.dim_date import ensure_date
 from deriv_pipeline.layers.common import _data_dir, primary_key_columns, split_target
@@ -444,10 +446,94 @@ def scd2_baseline_seed(cfg: TableConfig, layer3_target, conn) -> int:
     return seeded
 
 
+def scd2_apply(cfg: TableConfig, layer3_target, conn) -> int:
+    """Calls `warehouse.apply_cdc_event()` by name — the one config-declared
+    exception to a generic upsert (ADR-1) — once per staging row, in true
+    file-arrival order (`staging_seq`, ADR-10), never resorted: the watermark
+    inside `apply_cdc_event` is the sole staleness guard by design, and
+    CL001's real file-order events (lsn 1005, then 1004 — stale, quarantined
+    by the function itself — then 1006) are the proof this isn't a
+    constructed example. A quarantined row still counts as "processed" here
+    (it satisfies the generic layer3 assertion: a layer3 row *or* a
+    quarantine row per layer2 row) since apply_cdc_event, not this loop,
+    decides accept vs. quarantine.
+
+    Three fixes from Step 6 dual review (both Opus and Sonnet independently
+    confirmed the first):
+
+    1. The replay SELECT is filtered by a semi-join against
+       `warehouse.cdc_watermark`, excluding any row this client's watermark
+       has already passed. `apply_cdc_event`'s own stale-lsn branch is not
+       idempotent — it writes a fresh `quarantine.rejected_rows` row every
+       time it's called with an already-applied lsn — so an unfiltered
+       replay on an `@daily` schedule re-quarantines the client's entire
+       history on every run (empirically: run1 quarantine=2 rows, run2=14).
+       This filter makes an already-applied row a true no-op at the Python
+       level, not just "rejected again silently."
+    2. `apply_cdc_event`'s `SELECT ... FOR UPDATE` on `cdc_watermark` takes no
+       lock at all when no row yet exists for that client — it just returns
+       no rows — so two concurrent first-applies for the same client could
+       both see NULL and collide on the watermark INSERT. A per-client
+       `pg_advisory_xact_lock` (same pattern already used in
+       `_resolve_risk_snapshot_key` above) serializes this without touching
+       the locked `sql/03` function.
+    3. A `delete` for a client with zero existing `dim_client_risk_snapshot`
+       rows is a silent triple no-op in `apply_cdc_event`: its tombstone
+       SELECT finds nothing to copy, so no dimension row is written, no
+       quarantine row is written either, yet the watermark still advances —
+       contradicting this function's own "a layer3 row *or* a quarantine
+       row" invariant and making the gap unrecoverable by a plain re-run.
+       Checked explicitly here and quarantined by name instead.
+    """
+    schema, table = split_target(cfg.layer2.target)
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT s.client_id, s.lsn, s.commit_ts, s.op, s.after"
+            f" FROM {schema}.{table} AS s"
+            f" WHERE NOT EXISTS ("
+            f"   SELECT 1 FROM warehouse.cdc_watermark AS w"
+            f"   WHERE w.client_id = s.client_id AND s.lsn <= w.last_applied_lsn"
+            f" )"
+            f" ORDER BY s.staging_seq"
+        )
+        rows = cur.fetchall()
+
+    processed = 0
+    for client_id, lsn, commit_ts, op, after in rows:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"cdc_apply:{client_id}",))
+            if op == "delete":
+                cur.execute(
+                    "SELECT 1 FROM warehouse.dim_client_risk_snapshot WHERE client_id = %s LIMIT 1",
+                    (client_id,),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        "INSERT INTO quarantine.rejected_rows"
+                        " (table_name, reason_code, severity, raw_payload)"
+                        " VALUES (%s, %s, %s, %s)",
+                        (
+                            "dim_client_risk_snapshot",
+                            "delete_with_no_baseline",
+                            "WARNING",
+                            Jsonb({"client_id": client_id, "lsn": lsn, "op": op}),
+                        ),
+                    )
+                    processed += 1
+                    continue
+            cur.execute(
+                "SELECT warehouse.apply_cdc_event(%s, %s, %s, %s, %s)",
+                (client_id, lsn, commit_ts, op, Jsonb(after) if after is not None else None),
+            )
+        processed += 1
+    return processed
+
+
 _STRATEGY_DISPATCH = {
     "fact_upsert": fact_upsert,
     "dimension_upsert": dimension_upsert,
     "scd2_baseline_seed": scd2_baseline_seed,
+    "scd2_apply": scd2_apply,
 }
 
 

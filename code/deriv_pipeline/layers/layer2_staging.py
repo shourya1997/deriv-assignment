@@ -7,9 +7,53 @@ from __future__ import annotations
 
 from datetime import date as _date
 
+from psycopg.types.json import Jsonb
+
 from deriv_pipeline.config import TableConfig
 from deriv_pipeline.layers.common import column_types, primary_key_columns, split_target
 from deriv_pipeline.transforms import compute_late_arrival, resolve_header
+
+
+def _stage_typed_passthrough(cfg: TableConfig, conn, raw_schema, raw_table, schema, table) -> int:
+    """A raw table with no `payload` column (e.g. client_profile_changes, a
+    typed CDC log — see layer1_raw.load's docstring) already carries real
+    column names straight from the source parser: no header/alias/drift
+    resolution applies, just copy `natural_key ∪ expected_columns` across
+    unchanged. Ordered by `raw_seq` (not a plain scan) and written to
+    staging one row at a time so staging's own `staging_seq` bigserial lands
+    in the exact same relative order scd2_apply must later replay in (ADR-10
+    — apply_cdc_event's watermark is the sole staleness guard, no batch
+    sort)."""
+    pk_cols = primary_key_columns(conn, schema, table)
+    raw_types = column_types(conn, raw_schema, raw_table)
+    value_cols = list(dict.fromkeys([*cfg.source.natural_key, *cfg.source.expected_columns]))
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(value_cols)} FROM {raw_schema}.{raw_table} ORDER BY raw_seq"
+        )
+        rows = cur.fetchall()
+        col_names = [d.name for d in cur.description]
+
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in value_cols if c not in pk_cols)
+    placeholders = ", ".join(f"%({c})s" for c in value_cols)
+    sql = (
+        f"INSERT INTO {schema}.{table} ({', '.join(value_cols)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {set_clause}"
+    )
+    for raw_row in rows:
+        r = dict(zip(col_names, raw_row))
+        params = {
+            c: (Jsonb(r[c]) if raw_types.get(c) == "jsonb" and r[c] is not None else r[c])
+            for c in value_cols
+        }
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {schema}.{table}")
+        return cur.fetchone()[0]
 
 
 def stage(cfg: TableConfig, conn) -> int:
@@ -18,6 +62,10 @@ def stage(cfg: TableConfig, conn) -> int:
     be higher when a natural key is re-delivered across multiple files."""
     raw_schema, raw_table = split_target(cfg.layer1.target)
     schema, table = split_target(cfg.layer2.target)
+
+    raw_types = column_types(conn, raw_schema, raw_table)
+    if "payload" not in raw_types:
+        return _stage_typed_passthrough(cfg, conn, raw_schema, raw_table, schema, table)
 
     with conn.cursor() as cur:
         cur.execute(f"SELECT source_file, payload FROM {raw_schema}.{raw_table} ORDER BY source_file")

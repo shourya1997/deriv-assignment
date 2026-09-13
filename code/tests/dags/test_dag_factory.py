@@ -52,6 +52,22 @@ def test_client_deposit_dag_has_no_dim_instrument_wait(dagbag):
     assert task_ids == {"land_layer1", "stage_layer2", "run_dq_checks", "load_layer3"}
 
 
+def test_client_profile_changes_dag_waits_for_scd2_baseline(dagbag):
+    """client_profile_changes' scd2_apply has the same cross-DAG shape as
+    client_trades' dim_instrument dependency: bootstrap_warehouse's baseline
+    seed must exist first (ADR-2/ADR-10), and nothing else orders this
+    @daily DAG after that schedule=None, manual DAG (Step 6 dual review
+    finding, by analogy with Step 5)."""
+    dag = dagbag.get_dag("table__client_profile_changes")
+    assert dag is not None
+    task_ids = {t.task_id for t in dag.tasks}
+    assert task_ids == {
+        "wait_for_scd2_baseline", "land_layer1", "stage_layer2", "run_dq_checks", "load_layer3",
+    }
+    wait = dag.get_task("wait_for_scd2_baseline")
+    assert list(wait.downstream_task_ids) == ["land_layer1"]
+
+
 def test_dags_dir_contains_only_factory_and_named_hand_authored_files():
     """Guards against the design silently degrading back to hand-authored
     per-table DAGs during later steps (Step 4-9 each add a config, never a

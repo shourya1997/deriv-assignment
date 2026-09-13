@@ -52,6 +52,57 @@ def _dim_instrument_populated() -> bool:
         conn.close()
 
 
+def _scd2_baseline_seeded() -> bool:
+    """Polled by wait_for_scd2_baseline below — same data-condition-poll
+    shape as _dim_instrument_populated, for client_profile_changes' own hard
+    prerequisite (ADR-2/ADR-10): every client with a staged CDC event (other
+    than one whose *only* event is an 'insert', which legitimately has no
+    baseline — see scd2_baseline_seed's own exclusion logic) must already
+    have a source_lsn=0 baseline row.
+
+    A bare `EXISTS(...WHERE source_lsn = 0)` (the original version of this
+    check) is satisfied forever after bootstrap_warehouse's *first* run, even
+    for a client onboarded afterwards with no baseline of their own — that
+    client's CDC-derived history would then apply with no ADR-2 window for
+    their pre-CDC-era fact rows to resolve into, and bootstrap_warehouse
+    can't retroactively fix it (scd2_baseline_seed skips any client who
+    already has real, source_lsn > 0, history). This set-based check is
+    per-client and re-evaluated on every poke, so it stays correct even if
+    bootstrap_warehouse is later re-triggered incrementally (Step 6 dual
+    review finding, Opus).
+
+    The global EXISTS is kept as a floor alongside the per-client check: on a
+    completely fresh deploy `staging.client_profile_changes` is still empty
+    (this DAG's own land_layer1/stage_layer2 run *after* this sensor), so the
+    per-client check alone would pass vacuously — nothing staged yet means
+    nothing to fail on — even though bootstrap_warehouse has never run."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    EXISTS(SELECT 1 FROM warehouse.dim_client_risk_snapshot WHERE source_lsn = 0)
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM (
+                            SELECT client_id, (array_agg(op ORDER BY staging_seq))[1] AS first_op
+                            FROM staging.client_profile_changes
+                            GROUP BY client_id
+                        ) AS first_events
+                        WHERE first_events.first_op != 'insert'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM warehouse.dim_client_risk_snapshot s
+                              WHERE s.client_id = first_events.client_id AND s.source_lsn = 0
+                          )
+                    )
+                """
+            )
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
 def _make_dag(cfg: TableConfig) -> DAG:
     orch = cfg.orchestration
     with DAG(
@@ -87,6 +138,19 @@ def _make_dag(cfg: TableConfig) -> DAG:
                 mode="reschedule",
             )
             wait_for_dim_instrument >> land_layer1
+        # client_profile_changes' scd2_apply has the same cross-DAG shape as
+        # requires_dim_instrument above: bootstrap_warehouse's baseline seed
+        # must exist first (ADR-2/ADR-10), and nothing else orders this
+        # @daily DAG after that schedule=None, manual DAG on a fresh deploy.
+        if orch.get("requires_scd2_baseline"):
+            wait_for_scd2_baseline = PythonSensor(
+                task_id="wait_for_scd2_baseline",
+                python_callable=_scd2_baseline_seeded,
+                poke_interval=30,
+                timeout=3600,
+                mode="reschedule",
+            )
+            wait_for_scd2_baseline >> land_layer1
         land_layer1 >> stage_layer2 >> run_dq_checks >> load_layer3
     return dag
 

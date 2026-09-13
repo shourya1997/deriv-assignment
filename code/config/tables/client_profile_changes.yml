@@ -1,0 +1,28 @@
+kind: table
+name: client_profile_changes
+source:
+  format: jsonl
+  glob: "client_profile_changes.jsonl"
+  natural_key: [client_id, lsn]
+  expected_columns: [client_id, lsn, commit_ts, op, before, after]
+layer1: {target: raw.client_profile_changes}
+layer2: {target: staging.client_profile_changes}
+layer3:
+  - target: warehouse.dim_client_risk_snapshot
+    strategy: scd2_apply
+orchestration:
+  schedule: "@daily"
+  start_date: "2024-01-01"
+  catchup: false
+  tags: [client, cdc]
+  # ADR-2's ordering invariant (bootstrap_warehouse's scd2_baseline_seed must
+  # complete before any apply_cdc_event call) still matters here even though
+  # apply_cdc_event itself tolerates either order: if CDC apply for a client
+  # runs first, scd2_baseline_seed's "already has real (source_lsn > 0)
+  # history" check then skips seeding a baseline for them entirely — leaving
+  # that client's pre-CDC-era fact rows (deposits/trades dated well before
+  # the earliest CDC event) with no risk_snapshot window to resolve into.
+  # bootstrap_warehouse is schedule=None (manual/one-time), so nothing
+  # otherwise orders this @daily DAG after it (Step 6, same cross-DAG shape
+  # as Step 5's requires_dim_instrument).
+  requires_scd2_baseline: true

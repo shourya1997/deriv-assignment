@@ -26,6 +26,7 @@ MANIFEST = [
     REPO_ROOT / "sql" / "04_backfill_reset.sql",
     REPO_ROOT / "code" / "migrations" / "008_data_quality.sql",
     REPO_ROOT / "code" / "migrations" / "009_reconciliation.sql",
+    REPO_ROOT / "code" / "migrations" / "010_cdc_ingestion_order.sql",
 ]
 
 _BOOTSTRAP = """

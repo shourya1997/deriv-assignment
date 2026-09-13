@@ -362,3 +362,86 @@ same central finding. **Fixes applied**, see ADR-9 for full detail:
   unenforced disjoint-`deposit_id` assumption between `vendor_deposits`/`client_deposit` sharing
   `fact_deposits` (Opus, no shipped data collides, `ReconciliationConfig` exists for this exact
   pair but isn't wired to enforce it until Step 9).
+
+## Step 6 — client_profile_changes.yml (scd2_apply / CDC)
+
+- New `client_profile_changes.yml`, the second and last config-declared exception to a generic
+  layer3 upsert (ADR-1/ADR-3): `strategy: scd2_apply` calls the locked `warehouse.apply_cdc_event()`
+  (`sql/03`) once per staged row, in true file-arrival order.
+- Generalized `layer1_raw.py`/`layer2_staging.py` to handle a second raw-table shape, detected
+  generically via `information_schema` column introspection (`"payload" in column_types(...)`),
+  never by hardcoded table name: `client_profile_changes` lands as typed columns directly (both
+  raw and staging), since `sql/04`'s reload driver (Step 7) needs to read it by real column name,
+  unlike every other source's `natural_key + jsonb payload` shape.
+- New `raw_seq`/`staging_seq` bigserial ordering columns (migration 010): a plain `SELECT` with no
+  `ORDER BY` gives no ordering guarantee, and `apply_cdc_event`'s watermark check is the *sole*
+  staleness guard by design (no batch sort) — so the replaying SELECT must preserve true
+  file-arrival order or a real out-of-order event could apply in the wrong order. Verified against
+  real data: CL001's file order is lsn 1005, then 1004 (stale), then 1006 (applied last, wins).
+- New `orchestration.requires_scd2_baseline` flag + `wait_for_scd2_baseline` `PythonSensor`, same
+  cross-DAG-race-avoidance shape as Step 5's `requires_dim_instrument`: gates the `@daily`
+  `client_profile_changes` DAG behind `bootstrap_warehouse`'s (`schedule=None`) baseline-seed step
+  having run first (ADR-2's ordering invariant, re-derived for Step 6 — see ARCHITECTURE_DECISIONS.md
+  ADR-10 for why it still matters even though `apply_cdc_event` itself tolerates either order).
+- 4 new integration tests against the real shipped `client_profile_changes.jsonl` (out-of-order
+  lsn quarantine + file-order apply, tombstone delete, insert-with-no-baseline, replay
+  idempotency) + 1 new DAG-shape test. Full suite: 92/92 passing (91 + 1 added post-review).
+  `scripts/verify.sh`: PASS end-to-end (config validation, full DAG list, every generated DAG
+  including `table__client_profile_changes` run twice via `airflow dags test`).
+
+**Dual review (Opus + Sonnet)**, both directly against the repo (no `isolation: worktree`, per
+ADR-9's lesson). Both independently confirmed the same most-severe finding; Opus's pass went
+further and caught two additional real bugs Sonnet didn't surface. **All 6 confirmed findings
+fixed**, see ARCHITECTURE_DECISIONS.md ADR-10 for full detail:
+  - **Unbounded quarantine growth on every rerun (both reviewers, highest confidence, empirically
+    reproduced: run1 quarantine=2 rows, run2=14)** — `scd2_apply`'s replay `SELECT` was
+    unconditional, re-scanning the *entire* staging table on every call; `apply_cdc_event`'s
+    stale-lsn branch is not idempotent (it writes a fresh `quarantine.rejected_rows` row every
+    time it's called with an already-applied lsn), so an `@daily` schedule would re-quarantine a
+    client's whole history every single day, burying the one real signal (a genuine out-of-order
+    event) in permanently-growing replay noise. Fixed: the replay `SELECT` is now filtered by a
+    semi-join against `warehouse.cdc_watermark` (`WHERE NOT EXISTS (... s.lsn <= w.last_applied_lsn)`),
+    making an already-applied row a true no-op at the Python level. The idempotency test was
+    extended to assert on `quarantine.rejected_rows` count too, not just the snapshot table (the
+    original version of this test would have passed while this bug happened).
+  - **`wait_for_scd2_baseline`'s check was a one-time global existence test, but the invariant is
+    per-client and ongoing (Opus)** — `EXISTS(...WHERE source_lsn = 0)` is satisfied forever after
+    bootstrap_warehouse's *first* run, even for a client onboarded later with no baseline of their
+    own; combined with `scd2_baseline_seed`'s "skip if already has real history" guard, the miss
+    would be permanent and unrecoverable through normal operation. Fixed: the sensor now also
+    checks, set-based, that every client with a staged CDC event (other than one whose *only*
+    event is an `insert`) already has a `source_lsn = 0` baseline row — kept alongside the
+    original global check as a floor, since on a fresh deploy `staging.client_profile_changes` is
+    still empty when this sensor first runs (this DAG's own `land_layer1`/`stage_layer2` haven't
+    executed yet), so the per-client check alone would pass vacuously.
+  - **Concurrent DAG runs could crash on the `cdc_watermark` insert (Opus)** — `sql/03`'s
+    `SELECT ... FOR UPDATE` takes no lock at all when no watermark row exists yet for a client; two
+    concurrent first-applies for the same client could both see `NULL` and collide on the
+    watermark `INSERT`'s PK, rolling back the whole run with a raw `UniqueViolation`. Since
+    `sql/03` is locked, fixed in `scd2_apply` instead: a per-client
+    `pg_advisory_xact_lock(hashtext(...))`, the same pattern already used in
+    `_resolve_risk_snapshot_key` for an analogous stopgap race (ADR-9).
+  - **A `delete` for a client with zero existing snapshot rows was a silent triple no-op (Opus)** —
+    `apply_cdc_event`'s tombstone `SELECT` finds nothing to copy for such a client, so no dimension
+    row is written; no quarantine row is written either; yet the watermark still advances,
+    contradicting `scd2_apply`'s own "a layer3 row *or* a quarantine row per layer2 row" invariant
+    and making the gap unrecoverable by a plain rerun. Fixed: `scd2_apply` now checks explicitly
+    for an existing snapshot row before calling `apply_cdc_event` on a `delete`, and quarantines by
+    name (`delete_with_no_baseline`) instead of proceeding. New regression test added.
+  - **The typed-passthrough branch used `row[c]`, not `.get(c)` (both reviewers)** — a CDC source
+    that omits a key entirely (rather than emitting explicit `null`, e.g. many WAL decoders on
+    insert) would raise an uncaught `KeyError` and drop the whole batch with nothing landing in
+    quarantine; this path has no drift/quarantine handling of its own (unlike the jsonb-payload
+    path, which defers to layer2's `resolve_header`). Fixed: `.get(c)`, so a missing key becomes
+    `NULL` and is enforced by the column's own constraints if that's wrong, rather than crashing.
+  - **No config-load-time validation tied `scd2_apply`'s hardcoded column list, its target, or its
+    orchestration flag to the actual config (Opus)** — `scd2_apply` hardcodes
+    `client_id, lsn, commit_ts, op, after` and always writes to
+    `warehouse.dim_client_risk_snapshot`, but nothing checked `expected_columns` actually included
+    those names, that `target` was is that table, or that `requires_scd2_baseline` was set — a typo
+    in any of the three would silently NULL the dimension, silently ignore a misconfigured target,
+    or silently reintroduce the ADR-2 ordering race. Fixed: `config.py` now validates all three for
+    `strategy: scd2_apply` entries at config-load time, matching the existing
+    `fact_upsert`/`scd2_baseline_seed` pattern.
+- **No findings deferred this phase** — all 6 confirmed findings from both reviewers were fixed
+  before considering Step 6 done.
