@@ -4,7 +4,7 @@ Source of truth for "what phase am I on." Read this first in a fresh session, no
 Full spec: `/Users/shouryasengupta/.claude/plans/compiled-wobbling-quilt.md`.
 
 - [x] Step 0 — pivot logged in PROMPTS.md, git root confirmed, TASK/PROGRESS/ARCHITECTURE_DECISIONS.md created
-- [ ] Step 1 — harness: compose file, Dockerfile, db.py, migrate.py, gap-fill migrations
+- [x] Step 1 — harness: compose file, Dockerfile, db.py, migrate.py, gap-fill migrations
 - [ ] Step 2 — config schema (fixture-driven tests) + one real config (vendor_deposits.yml)
 - [ ] Step 3 — walking skeleton: vendor_deposits end-to-end (layer1→2→3, one generated DAG, `make verify` green)
 - [ ] Step 4 — dimensions properly (dim_manager/dim_instrument/dim_date, client_signup/client_profile) + G2 baseline seed

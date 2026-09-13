@@ -1,0 +1,7 @@
+psycopg[binary]==3.2.*
+pyyaml==6.*
+# GE's SqlAlchemyExecutionEngine runs on Airflow's pinned SQLAlchemy<2.0, which
+# has no native psycopg3 dialect - the [postgresql] extra pulls psycopg2-binary,
+# the driver GE actually needs against Postgres (Step 1 dual review finding).
+great_expectations[postgresql]==0.18.22
+pytest==8.*

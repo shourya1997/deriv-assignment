@@ -1,0 +1,96 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-deriv}:${POSTGRES_PASSWORD:-deriv}@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    DERIV_DSN: postgresql://${POSTGRES_USER:-deriv}:${POSTGRES_PASSWORD:-deriv}@postgres:5432/deriv
+    DERIV_TEST_DSN: postgresql://${POSTGRES_USER:-deriv}:${POSTGRES_PASSWORD:-deriv}@postgres:5432/deriv_test
+    DERIV_CONFIG_DIR: /opt/deriv/config
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./config:/opt/deriv/config
+    - ../sql:/opt/deriv/sql:ro
+    - ../data:/opt/deriv/data:ro
+    - .:/opt/deriv/code
+  depends_on:
+    postgres:
+      condition: service_healthy
+  user: "${AIRFLOW_UID:-50000}:0"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deriv}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deriv}
+      POSTGRES_DB: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # pg_isready with no -h probes the Unix socket, which the initdb bootstrap
+      # server answers on *before* 00_create_databases.sh has run — checking a
+      # real query against the airflow DB instead means healthy only fires once
+      # that script has actually created it (review finding, Step 1 dual review).
+      test: ["CMD-SHELL", "psql -U ${POSTGRES_USER:-deriv} -d airflow -c 'select 1' -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+        airflow users create --username admin --password admin --firstname admin --lastname admin --role Admin --email admin@example.com || true
+        python -m deriv_pipeline.migrate
+    restart: "no"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  tests:
+    <<: *airflow-common
+    profiles: ["test"]
+    entrypoint: /bin/bash
+    command: ["-c", "pytest /opt/deriv/code/tests"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:

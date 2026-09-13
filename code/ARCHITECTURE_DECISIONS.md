@@ -66,3 +66,30 @@ drop a `CLAUDE.md`-locked platform decision without disclosure).
 **Consequences:** `ge==0.18.22` pinned (0.18.x keeps the YAML suite format; 1.x dropped it).
 Any new table's DQ checks are SQL assertions in its config unless there's a specific reason to
 add it as a second real GE suite.
+
+## ADR-5 — Step 1 harness fixes (postgres healthcheck race, advisory lock, GE driver)
+
+**Context:** dual review (Opus + Sonnet) against the built harness surfaced three issues that
+would silently corrupt or block a clean `docker compose up` despite tests passing locally.
+**Decision:**
+1. Postgres healthcheck must run an actual query against the target DB (`psql ... select 1`),
+   not `pg_isready` with no host — `pg_isready` goes green against the Unix socket that's live
+   *during* `docker-entrypoint-initdb.d`, before `00_create_databases.sh` has created `deriv`/
+   `airflow`, so dependents could start against a not-yet-ready database.
+2. `migrate.py::run_migrations()` takes `pg_advisory_xact_lock` before checking/applying the
+   manifest, so two concurrent callers (e.g. a retried `airflow-init` alongside a local
+   `pytest` run) serialize instead of racing on the same `CREATE TABLE`/`CREATE FUNCTION` DDL.
+3. `great_expectations[postgresql]` (not bare `great_expectations`), because Airflow 2.10.5
+   pins `SQLAlchemy<2.0`, which has no native psycopg3 dialect — GE's planned
+   `SqlAlchemyExecutionEngine` (ADR-4) needs `psycopg2-binary` to talk to Postgres at all. The
+   Airflow 2.10.5 constraints file is passed to the image's `pip install` so this doesn't
+   silently downgrade Airflow's own pinned deps.
+**Alternatives considered:** leaving `pg_isready` and relying on `depends_on: service_healthy`
+timing to mask the race (rejected — passed locally by luck, not by construction, per Opus's
+finding); skipping the advisory lock since the harness has no current concurrent caller
+(rejected — cheap to add now, becomes load-bearing once Airflow retries or parallel test runs
+exist).
+**Consequences:** any future service added to `docker-compose.yml` that depends on Postgres
+being fully initialized (not just accepting connections) must declare `postgres:
+condition: service_healthy` explicitly — YAML anchors do not deep-merge, so an overridden
+`depends_on` block silently drops it if omitted (this exact bug hit 3 services in Step 1).

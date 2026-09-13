@@ -1,0 +1,22 @@
+[project]
+name = "deriv-pipeline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.2,<3.3",
+    "pyyaml>=6.0",
+]
+
+# apache-airflow itself is NOT a dependency here — the airflow image already
+# provides it, and re-resolving it via pip install -e would fight the image's
+# own constraints file. Airflow-dependent code only imports at DAG-parse time
+# inside the airflow containers, never from plain `pytest` runs on the host.
+[project.optional-dependencies]
+test = ["pytest>=8.0", "great_expectations[postgresql]==0.18.22"]
+
+[tool.setuptools.packages.find]
+include = ["deriv_pipeline*"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
