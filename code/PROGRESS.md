@@ -445,3 +445,74 @@ fixed**, see ARCHITECTURE_DECISIONS.md ADR-10 for full detail:
     `fact_upsert`/`scd2_baseline_seed` pattern.
 - **No findings deferred this phase** — all 6 confirmed findings from both reviewers were fixed
   before considering Step 6 done.
+
+## Step 7 — historical reload (cdc_historical_reload DAG)
+
+- New `deriv_pipeline/reload.py`: `historical_reload(conn, from_date, to_date)` re-issues `sql/04`'s
+  own driver query (`SELECT client_id, MIN(lsn) ... GROUP BY client_id`, bound to runtime params,
+  never hardcoded to November) and, per affected client, calls the locked
+  `warehouse.reset_client_for_reload()` then replays `raw.client_profile_changes` from the reset
+  point through `apply_cdc_event()` **in lsn order** — deliberately different from `scd2_apply`'s
+  streaming file-arrival-order replay (ADR-11), and exactly what lets a reload permanently repair a
+  version the streaming apply's watermark-only, no-sort design drops forever (real case: CL001's
+  file order is lsn 1005 then 1004 — quarantined as stale by `scd2_apply` — then 1006; a reload
+  over CL001's window inserts 1004 as a real non-current row without changing the final current
+  state).
+- Same per-client `pg_advisory_xact_lock(hashtext('cdc_apply:' || client_id))` `scd2_apply` already
+  takes, so a reload can never interleave with a concurrent streaming apply for the same client.
+- New `dags/cdc_historical_reload.py`: hand-authored (no `kind: table` config a reload could be
+  generated from — it iterates clients, not one table), `schedule=None` (operator-triggered repair,
+  not recurring ingestion), `from_date`/`to_date` as Airflow `Param`s, `max_active_runs=1`.
+- 6 new integration tests against real shipped data (repairs the dropped stale lsn version, keeps
+  an already-deleted client deleted — strengthened to assert the key itself changed, not just the
+  final flags — window with no overlap touches nothing — strengthened to assert full warehouse
+  state via a new `dump_state()` helper, not just the return value — idempotent rerun, and two new
+  FK-repoint tests added post-review, below) + 1 new DAG-shape test. Full suite: 99/99 passing
+  (97 + 2 added post-review). `scripts/verify.sh`: PASS end-to-end against the live `deriv` DB,
+  both `cdc_historical_reload` runs returning identical
+  `{'clients_reset': ['CL001', 'CL002', 'CL009', 'CL012', 'CL014', 'CL019', 'CL022', 'CL025'],
+  'events_replayed': 11}` and now asserted equal via a new `dump_state()`-based SQL-level diff, not
+  just a bare exit code (see F4 below).
+
+**Dual review (Opus + Sonnet)**, both directly against the repo (no `isolation: worktree`, per
+ADR-9's lesson). Sonnet found 1 bug also independently found by Opus; Opus found 3 more beyond
+that. **All 4 confirmed findings fixed**, see ARCHITECTURE_DECISIONS.md ADR-11 for full detail:
+  - **F2 — a `delete` for a client with zero existing snapshot rows was a silent no-op that still
+    advanced the watermark (both reviewers)** — the exact `delete_with_no_baseline` bug `scd2_apply`
+    already guards against (Step 6), re-drifted into `reload.py`'s first draft because the replay
+    loop called `apply_cdc_event` unconditionally. Fixed with the identical guard: check for an
+    existing `dim_client_risk_snapshot` row before a `delete` replay; on a miss, quarantine
+    (`delete_with_no_baseline`, `severity='WARNING'`) and skip instead of calling `apply_cdc_event`.
+  - **F1 — `reset_client_for_reload`'s unconditional DELETE can raise `ForeignKeyViolation` against
+    `fact_deposits`/`fact_trades` (Opus, highest severity)** — both fact tables FK into
+    `dim_client_risk_snapshot` with no `ON DELETE` clause (`sql/02_facts.sql`), and the delete
+    removes every row with `source_lsn >= reset_from_lsn` — including a client's *current* row,
+    which any of their fact rows dated after the CDC window would already be FK'd into. Latent in
+    the shipped demo data purely because every CDC-affected client's fact rows predate all CDC
+    activity, so they always resolve to the baseline row. Fixed: new `_repoint_facts_for_reset()` /
+    `_reresolve_facts_after_reload()` in `reload.py`, built on a new shared
+    `layers/common.fk_columns_into()` helper (extracted from `layer3_warehouse.py`'s pre-existing
+    stopgap-repoint code, which now calls the same helper instead of duplicating the `pg_constraint`
+    walk) and a new config-driven `config.fact_event_date_columns()` map. Before the reset, any fact
+    row FK'd into a doomed key is repointed onto the row that will be reactivated below
+    `reset_from_lsn`, or — when the client's *entire* history falls inside the window and nothing
+    survives to reactivate — a temporary sentinel row using the same negative-`source_lsn`/
+    `is_current=false` stopgap convention `_resolve_risk_snapshot_key` already established (ADR-7).
+    After replay, each repointed fact row is re-resolved via `warehouse.resolve_risk_snapshot_key()`
+    against its own event-date column, and the sentinel row (if created) is deleted once nothing
+    references it. Two new tests added: a fact row FK'd into CL001's current version across a
+    reload, and the deep combined case (a synthetic CDC-only client, no baseline at all, whose sole
+    version is both doomed and fact-referenced) forcing the sentinel-row path specifically.
+  - **F3 — deadlock risk between a reload run and a concurrent streaming `scd2_apply` run (Opus)** —
+    `historical_reload` held every affected client's advisory lock until one final whole-transaction
+    commit, and its driver query's `GROUP BY` gave no ordering guarantee, so two runs could acquire
+    the same set of per-client locks in different orders. Fixed with `ORDER BY client_id` on the
+    driver query (deterministic acquisition order) plus `max_active_runs=1` on the DAG (removes the
+    cross-run case entirely rather than requiring an operator runbook caveat).
+  - **F4 — `verify.sh`'s two `cdc_historical_reload` idempotency runs asserted nothing beyond exit
+    code 0 (Opus)** — a broken run that still exited 0 (e.g. one that silently touched the wrong
+    client) would have passed. Fixed: new `reload.dump_state()` (a deterministic snapshot of every
+    `dim_client_risk_snapshot` row and every fact row's resolved FK) invoked via a new
+    `python -m deriv_pipeline.reload --dump-state` CLI entrypoint, diffed between the two runs.
+- **No findings deferred this phase** — all 4 confirmed findings from both reviewers were fixed
+  before considering Step 7 done.

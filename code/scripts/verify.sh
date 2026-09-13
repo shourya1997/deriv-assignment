@@ -41,4 +41,17 @@ for dag_id in $dag_ids; do
     docker compose run --rm --no-deps airflow-scheduler airflow dags test "$dag_id" 2024-03-01
 done
 
+echo "-- cdc_historical_reload (run 1) -- manual, hand-authored (Step 7); must run after"
+echo "   table__client_profile_changes above so there is real CDC history to reset+replay"
+docker compose run --rm --no-deps airflow-scheduler airflow dags test cdc_historical_reload 2024-03-01
+reload_state_1="$(docker compose run --rm --no-deps airflow-scheduler python -m deriv_pipeline.reload --dump-state)"
+echo "-- cdc_historical_reload (run 2, idempotency) --"
+docker compose run --rm --no-deps airflow-scheduler airflow dags test cdc_historical_reload 2024-03-01
+reload_state_2="$(docker compose run --rm --no-deps airflow-scheduler python -m deriv_pipeline.reload --dump-state)"
+if [ "$reload_state_1" != "$reload_state_2" ]; then
+    echo "verify: FAIL — cdc_historical_reload is not idempotent:" >&2
+    diff <(echo "$reload_state_1") <(echo "$reload_state_2") >&2 || true
+    exit 1
+fi
+
 echo "== verify: PASS =="

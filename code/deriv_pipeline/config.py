@@ -408,6 +408,21 @@ class ReconciliationConfig:
         return [cls.load(path) for path in sorted(recon_dir.glob("*.yml"))]
 
 
+def fact_event_date_columns() -> dict[str, str]:
+    """target ('schema.table') -> event_date_column for every fact_upsert
+    layer3 entry across all shipped table configs. Config-driven (ADR-1)
+    lookup used by Step 7's historical reload to re-resolve a fact row's
+    risk_snapshot_key after a client's dim_client_risk_snapshot history is
+    rebuilt — reload.py has no config of its own to read this from since a
+    reload iterates clients, not one table (see cdc_historical_reload.py)."""
+    result: dict[str, str] = {}
+    for cfg in _load_all_table_dir():
+        for target in getattr(cfg, "layer3", None) or []:
+            if target.strategy == "fact_upsert":
+                result[target.target] = target.event_date_column
+    return result
+
+
 def validate_all() -> list[str]:
     """Loads every shipped config, returning names validated. Raises on the
     first invalid one (fail-fast, matching airflow-init's one-shot use), and

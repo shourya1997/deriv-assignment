@@ -68,6 +68,16 @@ def test_client_profile_changes_dag_waits_for_scd2_baseline(dagbag):
     assert list(wait.downstream_task_ids) == ["land_layer1"]
 
 
+def test_cdc_historical_reload_dag_exists_manual_only(dagbag):
+    """Step 7: hand-authored, not config-generated (no `kind: table` row a
+    reload could come from) — schedule=None, operator-triggered only."""
+    dag = dagbag.get_dag("cdc_historical_reload")
+    assert dag is not None
+    assert dag.schedule_interval is None
+    task_ids = [t.task_id for t in dag.tasks]
+    assert task_ids == ["run_reload"]
+
+
 def test_dags_dir_contains_only_factory_and_named_hand_authored_files():
     """Guards against the design silently degrading back to hand-authored
     per-table DAGs during later steps (Step 4-9 each add a config, never a

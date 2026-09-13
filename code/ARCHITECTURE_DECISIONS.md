@@ -451,3 +451,95 @@ should be re-examined for whether its precondition is really global or actually 
 same class of bug as finding 2 here); a strategy function that calls a locked, non-idempotent SQL
 function should filter its own replay set rather than relying on the function's internal checks
 to make reruns safe.
+
+## ADR-11 — Step 7: `cdc_historical_reload`, lsn-order replay, and the fact-FK repoint
+
+**Decision:** `deriv_pipeline.reload.historical_reload()` re-issues `sql/04`'s own driver query
+(`SELECT client_id, MIN(lsn) ... GROUP BY client_id`) with bound `from_date`/`to_date` params,
+then per affected client calls the locked `warehouse.reset_client_for_reload()` and replays
+`raw.client_profile_changes` from the reset point **in lsn order** — deliberately the opposite of
+`scd2_apply`'s streaming file-arrival-order replay (ADR-10). That difference is the entire point:
+`scd2_apply`'s watermark-only, no-sort design permanently quarantines a genuinely out-of-order
+event (real case: CL001's file order is 1005, then 1004, then 1006 — 1004 is dropped as stale
+forever), and only a from-scratch, correctly-ordered replay over raw history can put it back. The
+DAG (`dags/cdc_historical_reload.py`) is hand-authored, not config-generated — a reload iterates
+*clients*, not a `kind: table` config row — `schedule=None` (operator-triggered repair action, not
+recurring ingestion), and reuses `scd2_apply`'s own per-client advisory lock
+(`hashtext('cdc_apply:' || client_id)`) so a reload can never interleave with a concurrent
+streaming apply for the same client.
+
+**Dual review (Opus + Sonnet)**, both directly against the repo (no `isolation: worktree`, per
+ADR-9's lesson). Sonnet's one finding was independently also found by Opus; Opus found 3 more.
+**All 4 confirmed findings fixed:**
+
+1. **A `delete` for a client with zero existing snapshot rows was a silent no-op that still
+   advanced the watermark (both reviewers).** The exact `delete_with_no_baseline` bug ADR-10
+   finding 4 already guards against in `scd2_apply`, re-drifted into `reload.py`'s first draft
+   because its replay loop called `apply_cdc_event` unconditionally — `reset_client_for_reload`'s
+   reactivation is a documented no-op when nothing survives below the reset point, so a delete
+   replayed against that empty state finds nothing to tombstone. Fixed with the identical guard,
+   copied rather than shared, since the two call sites differ in exactly what "no rows for this
+   client" means at that point in each function's own control flow.
+2. **`reset_client_for_reload`'s unconditional `DELETE` can raise `ForeignKeyViolation` against
+   `fact_deposits`/`fact_trades` (Opus, highest severity).** Both fact tables FK into
+   `dim_client_risk_snapshot` with no `ON DELETE` clause (`sql/02_facts.sql`); the delete removes
+   every row with `source_lsn >= reset_from_lsn`, including a client's current row, which any fact
+   row dated after the CDC window already resolved into. Latent in the shipped demo data only
+   because every CDC-affected client's fact rows predate all CDC activity (Jan–Jul 2024 vs. Nov
+   2024), so they always resolve to the never-deleted baseline (`source_lsn=0`) row — a real design
+   gap, not a hypothetical one. Fixed with a repoint-before-delete / re-resolve-after-replay
+   sequence:
+   - A new `layers/common.fk_columns_into(conn, ref_schema, ref_table)` walks `pg_constraint`
+     directly (not `information_schema.columns` name-matching, which also matches views and can
+     miss a same-named non-FK column — ADR-9's own lesson) to find every `(fact_table, fk_column)`
+     pair FK'd into a given table. `layer3_warehouse._repoint_and_clear_stopgap_snapshots` (ADR-9's
+     stopgap-repoint code) now calls this shared helper instead of duplicating the walk.
+   - A new `config.fact_event_date_columns()` scans every shipped `kind: table` config's
+     `layer3` entries for `strategy: fact_upsert`, mapping each target to its
+     `event_date_column` — config-driven per ADR-1, since `reload.py` has no config of its own
+     (it iterates clients) to read this from otherwise.
+   - Before the reset, `reload._repoint_facts_for_reset()` finds every fact row FK'd into a
+     doomed key (`source_lsn >= reset_from_lsn`) and repoints it onto a safe key: the row that
+     will itself be reactivated below `reset_from_lsn`, if one exists. If the client's *entire*
+     history falls inside the reload window — nothing survives to reactivate — it instead inserts
+     a temporary sentinel row, reusing the exact negative-`source_lsn`/`is_current=false` stopgap
+     convention `_resolve_risk_snapshot_key` already established (ADR-7); `dim_client_risk_
+     snapshot` has no partial-unique constraint on `is_current` (only `uq_client_lsn UNIQUE
+     (client_id, source_lsn)`), so this coexists safely with any real current row.
+   - After replay, `reload._reresolve_facts_after_reload()` re-resolves each repointed fact row's
+     real key via the locked `warehouse.resolve_risk_snapshot_key(client_id, event_ts)` (the same
+     function `fact_upsert`'s own resolution already uses, at the same date-at-midnight-UTC
+     precision layer3_warehouse.py uses — an existing, not new, precision limitation), and deletes
+     the sentinel row afterward if one was created. Two new tests cover both paths: a fact row
+     FK'd into CL001's real current version, and the deep combined case — a synthetic CDC-only
+     client with no baseline profile at all, whose sole snapshot version is simultaneously doomed
+     and fact-referenced, forcing the sentinel-row branch specifically.
+3. **Deadlock risk between a reload run and a concurrent streaming `scd2_apply` run (Opus).**
+   `historical_reload` holds every affected client's advisory lock until one final
+   whole-transaction commit, and the driver query's `GROUP BY` gives Postgres no ordering
+   guarantee — a concurrent `scd2_apply` run (which locks clients in file-arrival order) could
+   acquire the same locks in a different order, a genuine cross-statement deadlock risk distinct
+   from (and not fixed by) the single-client locking that already correctly prevents the race it
+   was designed for. Fixed with `ORDER BY client_id` on the driver query (deterministic
+   acquisition order within any one reload run) plus `max_active_runs=1` on the DAG, which removes
+   the cross-*reload*-run case entirely rather than requiring an operator runbook caveat — chosen
+   over a per-client-commit design because it preserves this DAG's whole-run atomicity (a reload
+   is a repair action; a caller re-triggering after a partial failure should see one clean
+   all-or-nothing outcome, not a half-applied state to reason about).
+4. **`scripts/verify.sh`'s two `cdc_historical_reload` idempotency runs asserted nothing beyond
+   exit code 0 (Opus).** A broken run that still exited 0 — e.g. one that silently touched the
+   wrong client, or left a stray sentinel row behind — would have passed unnoticed. Fixed: a new
+   `reload.dump_state()` (a deterministic snapshot of every `dim_client_risk_snapshot` row plus
+   every fact row's resolved FK, across every `fact_event_date_columns()` target) exposed via a
+   `python -m deriv_pipeline.reload --dump-state` CLI entrypoint (mirroring `config.py`'s own
+   `--validate-all` CLI shape); `verify.sh` now diffs the two runs' dumps instead of trusting the
+   exit code alone.
+
+**Consequences:** any future fact table added via `fact_upsert` automatically participates in
+`fact_event_date_columns()` and therefore in the F1 repoint/re-resolve path with no `reload.py`
+change required, as long as its config declares `event_date_column` — this is the intended
+payoff of keeping that map config-driven rather than hardcoded. Any future code that needs "every
+fact table FK'd into dimension X" should use `fk_columns_into()` rather than re-deriving the
+`pg_constraint` walk a third time. The date-at-midnight resolution precision limit (multiple
+same-day snapshot versions can be ambiguous for a fact dated only to the day) is now used in two
+call sites, not one — worth revisiting if a future source needs finer-grained event timestamps.

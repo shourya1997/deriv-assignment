@@ -10,7 +10,7 @@ from psycopg.types.json import Jsonb
 
 from deriv_pipeline.config import TableConfig
 from deriv_pipeline.dims.dim_date import ensure_date
-from deriv_pipeline.layers.common import _data_dir, primary_key_columns, split_target
+from deriv_pipeline.layers.common import _data_dir, fk_columns_into, primary_key_columns, split_target
 from deriv_pipeline.transforms import earliest_op_per_client
 
 
@@ -303,21 +303,8 @@ def _repoint_and_clear_stopgap_snapshots(conn, client_id: str, real_key: int) ->
         stopgap_keys = [r[0] for r in cur.fetchall()]
         if not stopgap_keys:
             return
-        # Walk pg_constraint for real FKs into dim_client_risk_snapshot,
-        # rather than information_schema.columns matched by column name
-        # alone — the latter also matches views (which can't be UPDATEd)
-        # and would miss a same-named column that isn't actually an FK.
-        cur.execute(
-            """
-            SELECT conrelid::regclass::text, a.attname
-            FROM pg_constraint c
-            JOIN unnest(c.conkey) WITH ORDINALITY AS ck(attnum, ord) ON true
-            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ck.attnum
-            WHERE c.contype = 'f'
-              AND c.confrelid = 'warehouse.dim_client_risk_snapshot'::regclass
-            """
-        )
-        fk_columns = cur.fetchall()
+    fk_columns = fk_columns_into(conn, "warehouse", "dim_client_risk_snapshot")
+    with conn.cursor() as cur:
         for fact_table, fk_column in fk_columns:
             cur.execute(
                 f"UPDATE {fact_table} SET {fk_column} = %s WHERE {fk_column} = ANY(%s)",

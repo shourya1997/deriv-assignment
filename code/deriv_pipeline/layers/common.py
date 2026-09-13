@@ -44,6 +44,29 @@ def primary_key_columns(conn, schema: str, table: str) -> list[str]:
     return cols
 
 
+def fk_columns_into(conn, ref_schema: str, ref_table: str) -> list[tuple[str, str]]:
+    """Every (referencing_table, fk_column) pair with a real FK into
+    ref_schema.ref_table, found by walking pg_constraint rather than matching
+    information_schema.columns by column name alone — the latter also
+    matches views (which can't be UPDATEd) and would miss a same-named
+    column that isn't actually an FK (Step 4 dual review finding, first used
+    by layer3_warehouse's stopgap-snapshot repoint, Step 7's historical
+    reload repoint uses the same walk)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT conrelid::regclass::text, a.attname
+            FROM pg_constraint c
+            JOIN unnest(c.conkey) WITH ORDINALITY AS ck(attnum, ord) ON true
+            JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ck.attnum
+            WHERE c.contype = 'f'
+              AND c.confrelid = %s::regclass
+            """,
+            (f"{ref_schema}.{ref_table}",),
+        )
+        return cur.fetchall()
+
+
 def column_types(conn, schema: str, table: str) -> dict[str, str]:
     with conn.cursor() as cur:
         cur.execute(
