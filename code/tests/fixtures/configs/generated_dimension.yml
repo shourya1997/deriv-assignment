@@ -1,0 +1,5 @@
+kind: generated_dimension
+name: dim_date
+target: warehouse.dim_date
+from: "2024-01-01"
+to: "2024-12-31"

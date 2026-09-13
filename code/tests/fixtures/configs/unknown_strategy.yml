@@ -1,0 +1,13 @@
+kind: table
+name: unknown_strategy
+source:
+  format: csv
+  glob: "unknown_*.csv"
+  natural_key: [id]
+  expected_columns: [id, value]
+layer1: {target: raw.unknown_strategy}
+layer2: {target: staging.unknown_strategy, conflict_strategy: upsert_do_update}
+layer3:
+  - target: warehouse.fact_unknown
+    strategy: not_a_real_strategy
+orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [test]}

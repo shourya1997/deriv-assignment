@@ -1,0 +1,12 @@
+kind: table
+name: missing_natural_key
+source:
+  format: csv
+  glob: "missing_*.csv"
+  expected_columns: [id, value]
+layer1: {target: raw.missing_natural_key}
+layer2: {target: staging.missing_natural_key, conflict_strategy: upsert_do_update}
+layer3:
+  - target: warehouse.fact_missing
+    strategy: fact_upsert
+orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [test]}

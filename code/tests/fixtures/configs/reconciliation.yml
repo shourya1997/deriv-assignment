@@ -1,0 +1,5 @@
+name: vendor_feed
+left: staging.vendor_deposits
+right: staging.client_deposit
+key: deposit_id
+compare_columns: [amount_usd, deposit_date]

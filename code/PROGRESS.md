@@ -64,3 +64,39 @@ repo actually in" independent of git history.
   - Stale docstring/comment wording fixed in `migrate.py` and `verify.sh`.
 - Open issues carried into Step 2: `airflow-init` needs `python -m deriv_pipeline.config
   --validate-all` added back once `deriv_pipeline/config.py` exists.
+
+## Step 2 — config schema (IN PROGRESS — stopped at 90% usage safeguard)
+
+- Written so far (red, not yet green — `deriv_pipeline/config.py` does not exist yet):
+  `tests/unit/test_config.py` (6 tests: minimal table parse, unknown-strategy rejection,
+  missing-natural-key rejection, derived_dimension parse, generated_dimension parse,
+  reconciliation parse) and matching fixtures in `tests/fixtures/configs/`:
+  `minimal_table.yml`, `unknown_strategy.yml`, `missing_natural_key.yml`,
+  `derived_dimension.yml`, `generated_dimension.yml`, `reconciliation.yml`.
+- **Not yet done — next session starts here:**
+  1. Implement `deriv_pipeline/config.py`: `TableConfig` (kind/name/source/layer1/layer2/
+     layer3 dataclasses, `.load(path)` classmethod, `.load_all(kind=...)` classmethod scanning
+     `config/tables/*.yml`), `DerivedDimensionConfig`, `GeneratedDimensionConfig` (parses
+     `from`/`to` as dates), `ReconciliationConfig` (`.load_all()` scanning
+     `config/reconciliations/*.yml`). Validate `layer3[i].strategy` against the enum
+     `dimension_upsert | fact_upsert | scd2_apply | scd2_baseline_seed` (raise `ValueError`
+     mentioning "strategy" on an unknown value) and require `source.natural_key` to be present
+     and non-empty (raise `ValueError` mentioning "natural_key" if missing) — see the exact
+     fixture files and test assertions in `tests/unit/test_config.py` for the precise API shape
+     expected (attribute names: `cfg.kind`, `cfg.name`, `cfg.source.natural_key`,
+     `cfg.layer1.target`, `cfg.layer2.target`, `cfg.layer3[i].strategy`,
+     `DerivedDimensionConfig.source_table/source_column/target`,
+     `GeneratedDimensionConfig.target/from_date/to_date`,
+     `ReconciliationConfig.name/left/right`).
+  2. Run `pytest tests/unit/test_config.py -v` locally (venv) until all 6 pass.
+  3. Only then write the real `config/tables/vendor_deposits.yml` (per the plan's normative
+     schema example) plus a **separate** `test_all_shipped_configs_validate` test — not a
+     tautology reusing the same fixture-driven test.
+  4. Add `python -m deriv_pipeline.config --validate-all` back into `airflow-init`'s command in
+     `docker-compose.yml` (removed in Step 1 because the module didn't exist yet) as a
+     `__main__` block in `config.py` that calls `TableConfig.load_all()` /
+     `ReconciliationConfig.load_all()` for every kind and exits non-zero on any failure.
+  5. Dual review (Opus + Sonnet), apply fixes, then run the full per-phase ritual (append this
+     section properly, check off Step 2 in TASK.md, ADR entry if any new decision, commit,
+     update tracker artifact, compact context) before moving to Step 3.
+- No commit yet for this partial work — it is staged/on-disk only as of this snapshot.

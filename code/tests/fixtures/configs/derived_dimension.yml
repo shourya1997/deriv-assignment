@@ -1,0 +1,5 @@
+kind: derived_dimension
+name: dim_manager
+source_table: client_signup
+source_column: assigned_manager
+target: warehouse.dim_manager

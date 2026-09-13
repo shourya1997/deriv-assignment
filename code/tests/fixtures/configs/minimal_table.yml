@@ -1,0 +1,13 @@
+kind: table
+name: minimal_table
+source:
+  format: csv
+  glob: "minimal_*.csv"
+  natural_key: [minimal_id]
+  expected_columns: [minimal_id, value]
+layer1: {target: raw.minimal_table}
+layer2: {target: staging.minimal_table, conflict_strategy: upsert_do_update}
+layer3:
+  - target: warehouse.fact_minimal
+    strategy: fact_upsert
+orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [test]}
