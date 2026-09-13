@@ -22,6 +22,13 @@ echo "== 3/4: airflow dags list =="
 docker compose run --rm --no-deps airflow-scheduler airflow dags list
 
 echo "== 4/4: airflow dags test (each generated DAG, twice for idempotency) =="
+echo "-- bootstrap_warehouse (run 1) -- cross-config ordering (dim_manager etc.) must land"
+echo "   before any standalone table__client_signup/client_profile DAG test below can resolve"
+echo "   their dimension_upsert FK lookups (ADR-1, ADR-2)."
+docker compose run --rm --no-deps airflow-scheduler airflow dags test bootstrap_warehouse 2024-03-01
+echo "-- bootstrap_warehouse (run 2, idempotency) --"
+docker compose run --rm --no-deps airflow-scheduler airflow dags test bootstrap_warehouse 2024-03-01
+
 dag_ids="$(docker compose run --rm --no-deps airflow-scheduler airflow dags list -o plain | tail -n +2 | awk '{print $1}' | grep '^table__' || true)"
 if [ -z "$dag_ids" ]; then
     echo "verify: FAIL — no table__* DAGs found (airflow dags list produced none)" >&2

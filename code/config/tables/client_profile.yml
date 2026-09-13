@@ -1,0 +1,27 @@
+kind: table
+name: client_profile
+source:
+  format: json
+  glob: "client_profile.json"
+  natural_key: [client_id]
+  expected_columns: [client_id, full_name, date_of_birth, nationality,
+                     risk_category, account_balance_usd, account_status,
+                     currency, last_login_date, preferred_language]
+layer1: {target: raw.client_profile}
+layer2:
+  target: staging.client_profile
+  conflict_strategy: upsert_do_update
+  update_columns: [full_name, date_of_birth, nationality, risk_category,
+                    account_balance_usd, account_status, currency,
+                    last_login_date, preferred_language]
+layer3:
+  - target: warehouse.dim_client
+    strategy: dimension_upsert
+    columns: [full_name, date_of_birth, nationality, currency, preferred_language]
+  - target: warehouse.dim_client_risk_snapshot
+    strategy: scd2_baseline_seed
+    columns: [risk_category, account_balance_usd, account_status]
+    cdc_source_glob: "client_profile_changes.jsonl"
+# schedule: null — see client_signup.yml's identical note (Opus dual-review
+# finding — Step 4): static snapshot, ordering owned by bootstrap_warehouse.
+orchestration: {schedule: null, start_date: "2024-01-01", catchup: false, tags: [client]}

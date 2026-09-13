@@ -43,6 +43,24 @@ def resolve_header(
     return ResolvedHeader(colmap=colmap, schema_drift_detected=drift, unrecognized=unrecognized)
 
 
+def earliest_op_per_client(records: list[dict]) -> dict[str, str]:
+    """Given parsed client_profile_changes.jsonl records (each with `lsn`,
+    `client_id`, `op`), returns {client_id: op of that client's lowest-lsn
+    record}. Used by scd2_baseline_seed (ADR-2) to exclude any client whose
+    very first CDC event is an 'insert' — that client had no pre-existing
+    state for a baseline row to represent (Step 4 design; see
+    ARCHITECTURE_DECISIONS.md)."""
+    earliest: dict[str, tuple[int, str]] = {}
+    for record in records:
+        client_id = record["client_id"]
+        lsn = record["lsn"]
+        op = record["op"]
+        current = earliest.get(client_id)
+        if current is None or lsn < current[0]:
+            earliest[client_id] = (lsn, op)
+    return {client_id: op for client_id, (_, op) in earliest.items()}
+
+
 def compute_late_arrival(
     source_file: str, event_date: date, pattern: str, threshold_days: int
 ) -> bool:

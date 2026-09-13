@@ -55,7 +55,10 @@ def stage(cfg: TableConfig, conn) -> int:
         row_out["schema_drift_detected"] = schema_drift_detected
         row_out["is_late_arrival"] = is_late_arrival
 
-        cols = list(row_out.keys())
+        # Not every staging table tracks drift/late-arrival (e.g.
+        # client_signup/client_profile have neither column) — only persist
+        # the flags the target table actually has room for.
+        cols = [c for c in row_out.keys() if c in types]
         # schema_drift_detected/is_late_arrival are sticky: once true for a
         # natural key (any file/redelivery), they must stay true even if a
         # later redelivery looks "clean" on its own — OR-combine against the

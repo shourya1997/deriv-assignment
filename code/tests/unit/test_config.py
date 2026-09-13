@@ -40,6 +40,46 @@ def test_parses_derived_dimension_config():
     assert cfg.source_table == "client_signup"
     assert cfg.source_column == "assigned_manager"
     assert cfg.target == "warehouse.dim_manager"
+    assert cfg.target_key_column == "manager_id"
+    assert cfg.raw_source_glob is None
+    assert cfg.derived_columns == {}
+
+
+def test_parses_derived_dimension_config_with_raw_source_glob_and_derived_columns(tmp_path):
+    from deriv_pipeline.config import DerivedDimensionConfig
+
+    path = tmp_path / "dim_instrument.yml"
+    path.write_text(
+        "kind: derived_dimension\nname: dim_instrument\n"
+        "raw_source_glob: client_trades.json\nsource_column: instrument\n"
+        "target: warehouse.dim_instrument\ntarget_key_column: instrument_name\n"
+        "derived_columns:\n  asset_class:\n    EUR/USD: FX\n"
+    )
+    cfg = DerivedDimensionConfig.load(path)
+    assert cfg.source_table is None
+    assert cfg.raw_source_glob == "client_trades.json"
+    assert cfg.derived_columns == {"asset_class": {"EUR/USD": "FX"}}
+
+
+def test_derived_dimension_config_requires_exactly_one_source(tmp_path):
+    from deriv_pipeline.config import DerivedDimensionConfig
+
+    neither = tmp_path / "neither.yml"
+    neither.write_text(
+        "kind: derived_dimension\nname: x\nsource_column: y\n"
+        "target: warehouse.z\ntarget_key_column: z_id\n"
+    )
+    with pytest.raises(ValueError, match="source_table or raw_source_glob"):
+        DerivedDimensionConfig.load(neither)
+
+    both = tmp_path / "both.yml"
+    both.write_text(
+        "kind: derived_dimension\nname: x\nsource_table: t\n"
+        "raw_source_glob: g.json\nsource_column: y\n"
+        "target: warehouse.z\ntarget_key_column: z_id\n"
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DerivedDimensionConfig.load(both)
 
 
 def test_parses_generated_dimension_config():
@@ -70,6 +110,10 @@ def test_all_shipped_configs_validate():
 
     names = validate_all()
     assert "vendor_deposits" in names
+    for expected in (
+        "client_signup", "client_profile", "dim_manager", "dim_instrument", "dim_date",
+    ):
+        assert expected in names
 
 
 def test_rejects_natural_key_as_scalar():
@@ -123,6 +167,23 @@ def test_validate_all_raises_on_empty_config_dir(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="no config files found"):
         config_module.validate_all()
+
+
+def test_rejects_scd2_baseline_seed_without_cdc_source_glob(tmp_path):
+    """A silently-missing cdc_source_glob would make scd2_baseline_seed fall
+    back to excluding nobody, fabricating a baseline for an insert-first
+    client (e.g. CL030) — must fail at config-load time, not at runtime."""
+    from deriv_pipeline.config import TableConfig
+
+    path = tmp_path / "bad_baseline_seed.yml"
+    path.write_text(
+        "kind: table\nname: bad\n"
+        "source: {format: json, glob: 'x.json', natural_key: [client_id]}\n"
+        "layer1: {target: raw.x}\nlayer2: {target: staging.x}\n"
+        "layer3:\n  - {target: warehouse.dim_client_risk_snapshot, strategy: scd2_baseline_seed}\n"
+    )
+    with pytest.raises(ValueError, match="cdc_source_glob"):
+        TableConfig.load(path)
 
 
 def test_rejects_generated_dimension_from_after_to():

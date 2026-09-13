@@ -166,3 +166,87 @@ block the fallback).
 `dim_client_risk_snapshot` row with `source_lsn < 0` per client as part of applying the real,
 properly-ordered baseline seed — it cannot assume the table starts empty, since this is a
 persistent live DB shared across steps, not a fresh fixture per phase.
+
+## ADR-8 — Step 4: dimensions properly, real G2 baseline seed, and orphan-client handling
+
+**Context:** Step 4 onboards `client_signup`/`client_profile` as full config-driven tables and
+adds two new dimension-config kinds (`derived_dimension`: `dim_manager`, `dim_instrument;
+`generated_dimension`: `dim_date`), plus the real ADR-2 G2 baseline seed for
+`dim_client_risk_snapshot` that Step 3's stopgap (ADR-7) exists to tide over until.
+
+**Decisions:**
+1. **Derived-dimension source, per dimension.** `dim_manager` reads distinct `assigned_manager`
+   values from the already-staged `staging.client_signup` table (`source_table`). `dim_instrument`
+   instead reads directly from the raw `data/client_trades.json` file (`raw_source_glob`),
+   because `client_trades.yml` has no `kind: table` config until Step 5 — reading from a
+   not-yet-onboarded staging table would create a forward dependency `bootstrap_warehouse` can't
+   express. `DerivedDimensionConfig` requires exactly one of the two at config-load time.
+2. **Owned-column `dimension_upsert` into a shared dimension.** `client_signup` and
+   `client_profile` both write into `warehouse.dim_client`, but each config's `layer3[].columns`
+   lists only the columns that source owns (e.g. `client_signup` never touches
+   `full_name`/`risk_category`). `fk_resolution` resolves a column (e.g. `manager_key`) via
+   another dimension's natural key instead of copying a raw value.
+3. **Orphan-client baseline handling (generic, not hardcoded).** ADR-2's text calls out
+   CL099/CL031-shaped clients — referenced by fact tables but absent from `client_profile`
+   entirely — as needing a sentinel baseline (`risk_category='unknown'`,
+   `account_balance_usd=0.00`, `account_status='unknown'`). Implemented generically:
+   `scd2_baseline_seed` finds orphans as "has a Step 3 `source_lsn < 0` stopgap row in
+   `dim_client_risk_snapshot` AND never appeared in this run's `client_profile` rows AND wasn't
+   excluded as insert-first," not by hardcoded client_id. This was a dual-review finding
+   (Sonnet #3 / Opus #4, independently convergent) — the first implementation only seeded
+   baselines for clients present in `client_profile`, silently leaving orphans stuck on a
+   Step 3 stopgap forever, which ADR-7 explicitly frames as temporary.
+4. **Guard against overlapping real history.** `scd2_baseline_seed` now skips seeding (rather
+   than inserting) for any client who already has a `source_lsn > 0` row — a wide-open
+   1970–9999 baseline landing after real CDC history exists would create two overlapping
+   `is_current=true` rows, the exact failure mode ADR-7 rule 1 exists to prevent on the Step 3
+   side (Opus dual-review finding).
+5. **`bootstrap_warehouse` DAG edge, not two independent branches.** `client_signup`'s and
+   `client_profile`'s upserts both write into `warehouse.dim_client`; the DAG now sequences
+   `upsert_client_signup_dimension >> stage_client_profile` instead of running the two branches
+   independently, so a real scheduler can't run them concurrently against the same row
+   (Opus dual-review finding).
+6. **`client_signup`/`client_profile` orchestration schedule is `null`, not `@daily`.** Both are
+   static one-time snapshot files; `dag_factory.py` auto-generates a standalone `table__*` DAG
+   for every `kind: table` config regardless of schedule, and a `@daily`-scheduled instance of
+   that auto-generated DAG would run concurrently with (and independently of)
+   `bootstrap_warehouse`'s hand-ordered sequencing — wrong semantically and a source of
+   deadlock/ordering risk (Opus dual-review finding). `verify.sh`'s `airflow dags test
+   bootstrap_warehouse` runs (twice, for idempotency) before the loop over all `table__*` DAGs
+   specifically so a fresh environment's standalone `table__client_signup`/`table__client_profile`
+   test run doesn't fail resolving `dim_manager`/`dim_client` FKs that only `bootstrap_warehouse`
+   populates first.
+7. **Rowcount-based, not unconditional, counters.** Both `derived.py`'s `load()` and
+   `scd2_baseline_seed`'s orphan/normal seeding paths count actual writes via `cur.rowcount`
+   (or a dedicated newly-inserted check before the stopgap repoint), not `+= 1` per candidate
+   considered — a rerun's `ON CONFLICT DO NOTHING` no-ops must not inflate the reported count.
+
+**Dual review (Opus + Sonnet), fixes applied:** NULL FK value crash in `_resolve_dimension_fk`
+(both reviewers, independently) — now returns `None` immediately for a `None` input instead of
+issuing a `WHERE col = NULL` lookup that always misses and then raising; missing
+`cdc_source_glob` validation for `scd2_baseline_seed` at config-load time (Sonnet) — now raises
+`ValueError` in `TableConfig.load()`; TOCTOU gap in `_repoint_and_clear_stopgap_snapshots`
+(Opus) — the final DELETE now uses the exact `stopgap_keys` list captured by the initial SELECT,
+not a re-evaluated predicate; fact-table FK discovery via `information_schema.columns` matching
+column name could match views or the dimension's own PK column (Opus) — replaced with a
+`pg_constraint`/`pg_attribute` walk for true FKs into `dim_client_risk_snapshot`; orphan-client
+baseline gap (Sonnet/Opus, convergent) — see decision 3 above; missing DAG edge (Opus) — see
+decision 5; `@daily` schedule mismatch (Opus) — see decision 6; unconditional counters (Opus,
+partial) — see decision 7.
+
+**Deferred (accepted limitations, not fixed this phase):** Sonnet #4 (no dedup guard if a
+config's `columns:` list repeats an entry — malformed config, not exercised by any shipped
+config); Sonnet #5 (JSON floats parsed as Python `float` rather than `Decimal` — acceptable at
+this prototype's scale, revisit if real currency-precision requirements surface); Opus #10
+(multi-column natural keys / column-name collisions across dimensions — no shipped config needs
+this yet); Opus #11 (`derived.py` hardcodes the `staging.` schema prefix rather than resolving
+the referenced table config's actual `layer2.target` — every shipped `source_table` case
+happens to target `staging.*`, so this is a latent forward-compat gap, not a live bug); Opus #12
+(`derived_dimension`'s hard-fail on an unmapped `derived_columns` value is deliberate fail-loud
+behavior per this project's established convention, not something to soften).
+
+**Consequences:** Step 6's CDC-apply DAG must depend on `bootstrap_complete` (ADR-2's ordering
+invariant, restated from ADR-7) — the baseline seed, including the orphan-client sentinel path,
+must exist before any `apply_cdc_event` call. The `source_lsn > 0` guard added in decision 4
+means `scd2_baseline_seed` becomes a safe no-op once Step 6 lands, rather than needing to be
+disabled or special-cased.

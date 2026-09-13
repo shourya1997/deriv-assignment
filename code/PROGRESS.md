@@ -203,3 +203,77 @@ repo actually in" independent of git history.
   baseline yet — Step 4's real, ordered ADR-2 `bootstrap_warehouse` baseline seed must find
   and supersede/replace these (by `source_lsn < 0`) rather than assume a clean table, since
   this is a persistent live DB shared across steps.
+
+## Step 4 — dimensions properly + G2 baseline seed
+
+- Added `dims/generated.py` (`dim_date`, reuses Step 3's `dim_date.ensure_date()` over a
+  configured date range) and `dims/derived.py` (`dim_manager` from staged `client_signup`,
+  `dim_instrument` directly from raw `data/client_trades.json` since that table has no
+  `kind: table` config until Step 5). Added `dim_manager.yml`/`dim_instrument.yml`/`dim_date.yml`.
+- Extended `config.py`: `Layer3Target.cdc_source_glob`; `DerivedDimensionConfig` gained
+  `target_key_column` (required), `raw_source_glob` (alternative to `source_table`, exactly one
+  required), `derived_columns` (value-mapping for extra target columns).
+- Onboarded `client_signup.yml`/`client_profile.yml` as real `kind: table` configs, both using a
+  new **owned-column `dimension_upsert`** strategy into the shared `warehouse.dim_client` —
+  each source's `layer3[].columns` lists only the columns it owns; `client_signup` resolves
+  `assigned_manager` into `dim_manager`'s surrogate key via a new `fk_resolution` block.
+- Added `layers/layer3_warehouse.py::scd2_baseline_seed` — the real ADR-2 G2 baseline: one
+  `source_lsn=0`, `valid_from='1970-01-01'`, `is_current=true` row per client_profile-derived
+  client, excluding any client whose earliest CDC event (read directly from
+  `client_profile_changes.jsonl` via the new pure `transforms.py::earliest_op_per_client()`
+  helper) is an `insert` (currently CL030). Also repoints/clears any Step 3 stopgap rows
+  (ADR-7) onto the real baseline once it lands (`_repoint_and_clear_stopgap_snapshots`).
+- Hand-authored `dags/bootstrap_warehouse.py` (ADR-1): the one DAG expressing cross-config
+  topological order `dag_factory.py`'s per-table loop can't — stage client_signup → build
+  dim_manager (+ dim_instrument/dim_date, independent) → upsert client_signup's owned columns
+  → stage + upsert client_profile's owned columns and seed the real baseline → `bootstrap_complete`
+  sentinel for Step 6+'s CDC DAG to depend on.
+- Added JSON-array format support to `layer1_raw.py` (previously CSV-only, via a
+  `_FORMAT_READERS` dispatch) and generalized `layer2_staging.py::stage()` to work for staging
+  tables lacking `schema_drift_detected`/`is_late_arrival` columns (client_signup, client_profile).
+- Added `tests/integration/test_dimensions_pipeline.py` (11 tests) plus config/transform unit
+  tests. Fixed `scripts/verify.sh` to run `airflow dags test bootstrap_warehouse` (twice) before
+  the loop over all `table__*` DAGs, since the standalone `table__client_signup` DAG test needs
+  `dim_manager` already populated.
+- Full suite: 75/75 passing. `scripts/verify.sh`: PASS end-to-end.
+
+**Dual review (Opus + Sonnet), fixes applied** — see ADR-8 for full detail:
+  - NULL FK value crash in `_resolve_dimension_fk` (both reviewers, independently) — fixed to
+    return `None` immediately on a `None` input instead of crashing on an always-missing lookup.
+  - Missing `cdc_source_glob` validation for `scd2_baseline_seed` at config-load time (Sonnet) —
+    fixed: `TableConfig.load()` now raises `ValueError` if absent.
+  - TOCTOU gap in `_repoint_and_clear_stopgap_snapshots` (Opus) — fixed: the final DELETE now
+    uses the exact key list captured by the initial SELECT, not a re-evaluated predicate.
+  - `information_schema.columns`-based fact-table FK discovery could match views or the
+    dimension's own PK column (Opus) — fixed: replaced with a `pg_constraint`/`pg_attribute`
+    walk for true FKs.
+  - **Orphan-client baseline gap (Sonnet #3 / Opus #4, independently convergent, highest
+    confidence)** — the first implementation only seeded baselines for clients present in
+    `client_profile`, leaving CL099/CL031-shaped orphans permanently stuck on a Step 3 stopgap.
+    Fixed generically: `scd2_baseline_seed` now also seeds a sentinel baseline
+    (`risk_category='unknown'`, `account_balance_usd=0.00`, `account_status='unknown'`) for any
+    client found via "has a stopgap row AND never appeared in this run's client_profile rows,"
+    not hardcoded client IDs. Rewrote
+    `test_scd2_baseline_seed_gives_orphan_client_sentinel_baseline_and_clears_stopgaps` (was
+    `..._leaves_orphan_client_stopgaps_untouched`, which locked in the old, wrong behavior).
+  - Missing DAG edge between the client_signup and client_profile branches (Opus) — fixed:
+    `bootstrap_warehouse.py` now sequences `upsert_client_signup_dimension >> stage_client_profile`
+    instead of running them as independent branches, since both write into the same
+    `warehouse.dim_client` row.
+  - `@daily` schedule on both new table configs vs. static one-time snapshot files, racing
+    against `bootstrap_warehouse`'s hand-ordered sequencing (Opus) — fixed: both configs'
+    `orchestration.schedule` changed to `null`.
+  - No guard against overlapping real CDC history (Opus High #5, new) — fixed:
+    `scd2_baseline_seed` now skips any client with an existing `source_lsn > 0` row, so it
+    becomes a safe no-op once Step 6's CDC apply exists rather than creating a second
+    overlapping `is_current=true` row.
+  - Unconditional `+= 1` counters overstating work done on a no-op rerun (Opus, partial) —
+    fixed in both `derived.py::load()` and `scd2_baseline_seed` via `cur.rowcount`/a dedicated
+    newly-inserted check.
+- **Deferred as accepted limitations** (documented in ADR-8, not fixed this phase): repeated-
+  `columns:`-entry dedup guard (Sonnet, no shipped config exercises it); JSON float vs. Decimal
+  precision (Sonnet, acceptable at prototype scale); multi-column natural keys / column-name
+  collisions across dimensions (Opus, no shipped config needs it); `derived.py` hardcoding the
+  `staging.` schema prefix instead of resolving the referenced config's real `layer2.target`
+  (Opus, latent forward-compat gap); hard-fail on an unmapped `derived_columns` value (Opus,
+  deliberate fail-loud behavior per project convention, not a bug).

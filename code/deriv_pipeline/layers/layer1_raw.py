@@ -5,6 +5,7 @@ content-wise (ON CONFLICT DO UPDATE on the same payload)."""
 from __future__ import annotations
 
 import csv
+import json
 
 from psycopg.types.json import Jsonb
 
@@ -12,10 +13,26 @@ from deriv_pipeline.config import TableConfig
 from deriv_pipeline.layers.common import _data_dir, primary_key_columns, split_target
 
 
+def _read_csv_rows(path):
+    with path.open(newline="") as f:
+        yield from csv.DictReader(f)
+
+
+def _read_json_rows(path):
+    records = json.loads(path.read_text())
+    if not isinstance(records, list):
+        raise ValueError(f"layer1_raw: {path} must contain a JSON array of objects")
+    yield from records
+
+
+_FORMAT_READERS = {"csv": _read_csv_rows, "json": _read_json_rows}
+
+
 def load(cfg: TableConfig, conn) -> int:
     """Lands every file matching cfg.source.glob into cfg.layer1.target.
     Returns the number of rows landed (across all matched files)."""
-    if cfg.source.format != "csv":
+    read_rows = _FORMAT_READERS.get(cfg.source.format)
+    if read_rows is None:
         raise NotImplementedError(f"layer1_raw: unsupported source format {cfg.source.format!r}")
 
     schema, table = split_target(cfg.layer1.target)
@@ -41,12 +58,10 @@ def load(cfg: TableConfig, conn) -> int:
     landed = 0
     with conn.cursor() as cur:
         for path in files:
-            with path.open(newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    params = {col: row[col] for col in natural_key_cols}
-                    params["source_file"] = path.name
-                    params["payload"] = Jsonb(row)
-                    cur.execute(sql, params)
-                    landed += 1
+            for row in read_rows(path):
+                params = {col: row[col] for col in natural_key_cols}
+                params["source_file"] = path.name
+                params["payload"] = Jsonb(row)
+                cur.execute(sql, params)
+                landed += 1
     return landed

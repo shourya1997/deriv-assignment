@@ -1,0 +1,32 @@
+kind: table
+name: client_signup
+source:
+  format: json
+  glob: "client_signup.json"
+  natural_key: [client_id]
+  expected_columns: [client_id, signup_date, country, email, referral_source,
+                     account_type, kyc_status, signup_platform, promo_code,
+                     assigned_manager]
+layer1: {target: raw.client_signup}
+layer2:
+  target: staging.client_signup
+  conflict_strategy: upsert_do_update
+  update_columns: [signup_date, country, email, referral_source, account_type,
+                    kyc_status, signup_platform, promo_code, assigned_manager]
+layer3:
+  - target: warehouse.dim_client
+    strategy: dimension_upsert
+    columns: [country, referral_source, account_type, kyc_status,
+              signup_platform, promo_code, signup_date, manager_key]
+    fk_resolution:
+      manager_key:
+        from_column: assigned_manager
+        dim_target: warehouse.dim_manager
+        dim_natural_key: manager_id
+        dim_surrogate_key: manager_key
+# schedule: null — this is a static one-time snapshot file (not a daily
+# delta), and bootstrap_warehouse already owns its ordering relative to
+# dim_manager/client_profile (ADR-1). A recurring auto-generated DAG here
+# would be both semantically wrong and a source of unordered concurrent
+# writes into warehouse.dim_client (Opus dual-review finding — Step 4).
+orchestration: {schedule: null, start_date: "2024-01-01", catchup: false, tags: [client]}

@@ -1,0 +1,13 @@
+kind: derived_dimension
+name: dim_instrument
+raw_source_glob: "client_trades.json"
+source_column: instrument
+target: warehouse.dim_instrument
+target_key_column: instrument_name
+derived_columns:
+  asset_class:
+    EUR/USD: FX
+    USD/JPY: FX
+    Gold: Commodity
+    BTC/USD: Crypto
+    S&P500: Index

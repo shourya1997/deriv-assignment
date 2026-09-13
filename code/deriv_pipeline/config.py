@@ -83,6 +83,9 @@ class Layer3Target:
     strategy: str
     fk_resolution: dict = field(default_factory=dict)
     columns: list[str] | None = None
+    # scd2_baseline_seed only: glob (under data/) for the raw CDC source file
+    # used to exclude clients whose earliest event is an 'insert' (ADR-2/G2).
+    cdc_source_glob: str | None = None
 
 
 def _build_layer_target(raw: dict, path: Path, label: str) -> LayerTarget:
@@ -142,6 +145,15 @@ class TableConfig:
                     f"{path}: unknown layer3 strategy {strategy!r};"
                     f" must be one of {sorted(LAYER3_STRATEGIES)}"
                 )
+            if strategy == "scd2_baseline_seed" and not entry.get("cdc_source_glob"):
+                # Without this, a misspelled/omitted key silently seeds a
+                # fabricated baseline for an insert-first client (e.g. CL030)
+                # instead of excluding it — exactly what ADR-2 says must
+                # never happen. Fail loud at config-load time, not silently
+                # at runtime (Step 4 dual review finding).
+                raise ValueError(
+                    f"{path}: layer3 strategy scd2_baseline_seed requires cdc_source_glob"
+                )
             try:
                 columns = _require_str_list(entry, "columns", path, required=False) or None
                 layer3.append(
@@ -150,6 +162,7 @@ class TableConfig:
                         strategy=strategy,
                         fk_resolution=entry.get("fk_resolution", {}),
                         columns=columns,
+                        cdc_source_glob=entry.get("cdc_source_glob"),
                     )
                 )
             except (TypeError, KeyError) as exc:
@@ -174,21 +187,39 @@ class TableConfig:
 class DerivedDimensionConfig:
     kind: str
     name: str
-    source_table: str
     source_column: str
     target: str
+    target_key_column: str
+    source_table: str | None = None
+    # Set instead of source_table when the upstream table isn't onboarded yet
+    # (e.g. dim_instrument derives from client_trades.json, but client_trades
+    # isn't a `kind: table` config until Step 5) — reads distinct values
+    # directly from the raw data/ file instead of a staged table.
+    raw_source_glob: str | None = None
+    # Optional column_name -> {natural_key_value: derived_value} maps, e.g.
+    # dim_instrument's asset_class derived from the instrument name itself.
+    derived_columns: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> "DerivedDimensionConfig":
         path = Path(path)
         raw = _load_yaml(path)
+        source_table = raw.get("source_table")
+        raw_source_glob = raw.get("raw_source_glob")
+        if not source_table and not raw_source_glob:
+            raise ValueError(f"{path}: one of source_table or raw_source_glob is required")
+        if source_table and raw_source_glob:
+            raise ValueError(f"{path}: source_table and raw_source_glob are mutually exclusive")
         try:
             return cls(
                 kind=raw["kind"],
                 name=raw["name"],
-                source_table=raw["source_table"],
                 source_column=raw["source_column"],
                 target=raw["target"],
+                target_key_column=raw["target_key_column"],
+                source_table=source_table,
+                raw_source_glob=raw_source_glob,
+                derived_columns=raw.get("derived_columns", {}),
             )
         except KeyError as exc:
             raise ValueError(f"{path}: missing required key {exc}") from exc

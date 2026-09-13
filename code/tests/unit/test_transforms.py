@@ -2,7 +2,26 @@ from datetime import date
 
 import pytest
 
-from deriv_pipeline.transforms import compute_late_arrival, resolve_header
+from deriv_pipeline.transforms import compute_late_arrival, earliest_op_per_client, resolve_header
+
+
+def test_earliest_op_per_client_picks_lowest_lsn():
+    records = [
+        {"lsn": 1004, "client_id": "CL001", "op": "update"},
+        {"lsn": 1001, "client_id": "CL030", "op": "insert"},
+        {"lsn": 1012, "client_id": "CL002", "op": "update"},
+    ]
+    assert earliest_op_per_client(records) == {
+        "CL001": "update", "CL030": "insert", "CL002": "update",
+    }
+
+
+def test_earliest_op_per_client_ignores_lsn_input_order():
+    records = [
+        {"lsn": 1010, "client_id": "CL001", "op": "delete"},
+        {"lsn": 1004, "client_id": "CL001", "op": "update"},
+    ]
+    assert earliest_op_per_client(records) == {"CL001": "update"}
 
 EXPECTED = [
     "deposit_id", "client_id", "deposit_date", "amount_usd", "payment_method",
