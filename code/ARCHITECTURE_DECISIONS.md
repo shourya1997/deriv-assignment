@@ -126,3 +126,43 @@ much worse error message); logging a warning on an unknown `kind` instead of rai
 configs) must route through the same `_load_yaml`/`_require_str_list` helpers rather than
 re-implementing ad hoc parsing, so these three invariants stay enforced repo-wide rather than
 per-loader.
+
+## ADR-7 — Step 3 risk-snapshot stopgap-seed safety rules
+
+**Context:** Step 3's walking skeleton needs `_resolve_risk_snapshot_key()` to resolve a
+`risk_snapshot_key` for every vendor_deposits row, but ADR-2's real, properly-ordered G2
+baseline seed doesn't exist until Step 4's `bootstrap_warehouse` DAG. Every real fact row in
+Step 3 predates any CDC event, so every single lookup misses on first load. Dual review (Opus +
+Sonnet) independently flagged the first implementation's naive fallback — insert one wide-open
+`valid_from='1970-01-01', valid_to='9999-12-31', is_current=true` sentinel row per client on
+any miss — as unsafe on two counts: it can be silently shadowed by or collide with ADR-2's real
+seed once Step 4 lands, and it can violate `resolve_risk_snapshot_key()`'s own un-ordered
+`LIMIT 1` invariant (at most one row may cover any instant) *within Step 3 itself*, since one
+`fact_upsert()` run processes a client's deposits across multiple distinct `deposit_date`s with
+no real baseline for any of them.
+**Decision — the Step 3 stopgap seed (not a substitute for ADR-2, superseded by it in Step 4)
+must follow three rules:**
+1. Only seed when the client has zero rows with `source_lsn >= 0` (a "real" CDC/baseline lsn).
+   A miss against a client who already has real history means `event_ts` predates their
+   earliest real `valid_from` — a genuine backfill/reconciliation question, not something a
+   blind seed should paper over — so this case raises instead of guessing.
+2. Every stopgap window is the narrowest possible: `[event_ts, event_ts + 1 microsecond)`.
+   Since `event_ts` is always a `deposit_date` at midnight, distinct dates for the same client
+   can never overlap, and a repeat lookup for the same date idempotently resolves to the
+   already-seeded row instead of attempting a second insert.
+3. Every stopgap row uses a strictly negative `source_lsn` (`COALESCE(MIN(source_lsn), 0) - 1`
+   per client, so multiple stopgap windows per client get distinct values and never collide on
+   `uq_client_lsn`), and `is_current=false` — both so Step 4's real bootstrap can identify and
+   supersede every `source_lsn < 0` row per client, and so `source_lsn >= 0` remains a reliable
+   "this client has real history" signal for rule 1 above.
+**Alternatives considered:** a single 1970–9999 sentinel per client (rejected — both
+correctness failures above, confirmed independently by both review agents); deferring FK
+resolution entirely until Step 4 (rejected — blocks the whole point of Step 3, an actually-
+running walking skeleton); blocking on any existing row regardless of `source_lsn` sign
+(rejected during fix verification — real Step 3 data has clients with multiple deposit dates,
+so this raised spuriously on the second date for the same client; only *real* history should
+block the fallback).
+**Consequences:** Step 4's `bootstrap_warehouse` DAG must explicitly find and replace every
+`dim_client_risk_snapshot` row with `source_lsn < 0` per client as part of applying the real,
+properly-ordered baseline seed — it cannot assume the table starts empty, since this is a
+persistent live DB shared across steps, not a fresh fixture per phase.

@@ -121,3 +121,85 @@ repo actually in" independent of git history.
   `ReconciliationConfig.load_all()` already treats a missing directory as "zero results", not
   an error, so this is a documented gap rather than a bug — revisit if Step 9 needs an earlier
   placeholder.
+
+## Step 3 — walking skeleton: vendor_deposits end-to-end
+
+- Built the generic three-layer engine (`deriv_pipeline/layers/{common,layer1_raw,
+  layer2_staging,layer3_warehouse}.py`), pure transforms (`deriv_pipeline/transforms.py`:
+  `resolve_header` for schema-drift detection, `compute_late_arrival` for the
+  filename-derived delivery-date rule), the on-demand `dims/dim_date.py` (reused as-is by
+  Step 4's `generated_dimension` engine), the Airflow dynamic-DAG factory
+  (`dags/dag_factory.py`, one DAG shape: `land_layer1 >> stage_layer2 >> run_dq_checks >>
+  load_layer3`, `run_dq_checks` a no-op placeholder until Step 8), and `scripts/verify.sh`'s
+  remaining steps (config validate → pytest → `airflow dags list` → `airflow dags test` x2
+  per DAG for idempotency).
+- Tests green: 60/60 (added: 6 `test_transforms.py`, 2 `test_dim_date.py`, 7
+  `test_vendor_deposits_pipeline.py` integration tests against the real
+  `config/tables/vendor_deposits.yml` + real `data/deposits_vendor_*.csv` files, 3
+  `test_dag_factory.py` airflow-only tests) — run both locally (venv) and via
+  `docker compose --profile test run --rm tests`. Full `scripts/verify.sh` run end-to-end:
+  config validation OK, 60/60 pytest, `airflow dags list` shows `table__vendor_deposits`,
+  `airflow dags test` run twice both reached `state=success`.
+- Dual review (Opus + Sonnet) found 10 + 2 issues (1 overlapping), all fixed:
+  - **Most severe (both reviewers, independently):** the on-demand sentinel seed in
+    `layer3_warehouse.py::_resolve_risk_snapshot_key` (Step 3's deliberate stand-in for
+    ADR-2's real, properly-ordered G2 baseline seed, which lands in Step 4) originally
+    blindly inserted a wide-open `1970-9999, is_current=true` row on ANY resolution miss.
+    This could (a) collide with/be silently shadowed by Step 4's real ordered baseline seed,
+    and (b) even self-violate the "at most one matching row per instant" invariant
+    `resolve_risk_snapshot_key`'s un-ordered `LIMIT 1` depends on, since a single Step 3 run
+    can see the same client at multiple distinct `deposit_date`s with no real history for
+    any of them yet. Fixed: only seed when the client has zero *real* (`source_lsn >= 0`)
+    snapshot rows — a miss against real history now raises, signaling "needs a real
+    backfill decision" instead of guessing; each stopgap window is the narrowest possible
+    (`[event_ts, event_ts + 1us)`, since `event_ts` is always a deposit_date at midnight,
+    so distinct dates never overlap and the same date is idempotently reused); each gets its
+    own strictly-negative `source_lsn` (`MIN(source_lsn) - 1` per client) so multiple windows
+    per client don't collide on `uq_client_lsn`, and Step 4's real bootstrap can find/replace
+    every `source_lsn < 0` row per client once it lands. Documented in-line since this is a
+    load-bearing design decision, not just a bug fix — see ADR-7.
+  - **Opus:** unchecked `None` after the retry `fetchone()` in both `_resolve_client_key` and
+    `_resolve_risk_snapshot_key` — added explicit raises instead of a bare `NoneType` crash.
+  - **Opus:** `layer2_staging.py`'s upsert overwrote `schema_drift_detected`/`is_late_arrival`
+    on conflict instead of OR-combining — a clean redelivery could un-flag a natural key that
+    a dirtier earlier delivery had correctly flagged. Now `{table}.{col} OR EXCLUDED.{col}`.
+  - **Opus:** `layer2_staging.py`'s `update_columns + [flag columns]` wasn't deduplicated —
+    a config listing a flag column in `update_columns` would emit "multiple assignments to
+    same column" and fail at the SQL level. Deduplicated via `dict.fromkeys`.
+  - **Opus:** `layer1_raw.py`'s `ON CONFLICT DO UPDATE SET payload = EXCLUDED.payload` never
+    refreshed `source_file` — harmless today (source_file is part of vendor_deposits' PK) but
+    a latent bug for any future single-column-PK raw table. Added
+    `source_file = EXCLUDED.source_file`.
+  - **Opus:** `staged_at = now()` applied unconditionally, contradicting `part1_pipeline.md`'s
+    documented true-no-op-on-redelivery design. Now gated behind an `IS DISTINCT FROM` check
+    across every tracked column; a no-op redelivery leaves `staged_at` untouched.
+  - **Opus:** `layers/common.py::primary_key_columns()`'s join from
+    `information_schema.table_constraints` to `key_column_usage` was missing the
+    `table_schema`/`table_name` condition (joined on `constraint_name`/`constraint_schema`
+    only) — a real, if currently dormant, cross-table bug. Added the missing join condition.
+  - **Opus:** `scripts/verify.sh`'s DAG-test loop could pass vacuously if `airflow dags list`
+    errored or returned nothing (`2>/dev/null` plus an empty `for`-loop doesn't trip
+    `set -e`). Now captures the dag-id list into a variable and explicitly fails with a clear
+    message if it's empty; dropped the `2>/dev/null` swallowing.
+  - **Opus:** `test_layer3_inferred_member_pattern_for_orphan_client` only ever exercised the
+    "miss → stub" branch of `_resolve_client_key`, never proving the "already exists" branch
+    is distinguishable. Now also seeds a real (`is_inferred=false`) `dim_client` row for CL001
+    before running layer3 and asserts it's reused as-is (not re-stubbed, not duplicated).
+  - **Opus:** `test_full_pipeline_is_idempotent_end_to_end` only compared `count(*)` across
+    two runs, which can't catch a second run silently reshuffling FK keys or re-seeding
+    sentinels while leaving the row count flat. Now compares a full-content snapshot (every
+    fact column, plus `dim_client`/`dim_client_risk_snapshot` counts) across both runs.
+  - **Minor:** the hardcoded `date_key == 20240301` literal assertion is now derived from the
+    fetched row's own `deposit_date` at test time.
+  - **Sonnet (acceptable as scoped per both reviewers, documented not generalized):**
+    `fact_upsert()`'s column lists are hardcoded to vendor_deposits'/fact_deposits' shape;
+    `Layer3Target.columns` is defined but unused. Added an explicit in-code note on
+    `fact_upsert()` itself (not just the module docstring) that this needs to read from
+    `layer3_target.columns` before a second `fact_upsert`-strategy table can reuse it.
+- Re-ran the full suite (60/60) and `scripts/verify.sh` end-to-end after applying every fix
+  above — all green, both `airflow dags test` runs still `state=success`.
+- Open issues carried into Step 4: the Step 3 sentinel-seed stopgap leaves `source_lsn < 0`
+  rows in `warehouse.dim_client_risk_snapshot` for any client whose deposits had no real
+  baseline yet — Step 4's real, ordered ADR-2 `bootstrap_warehouse` baseline seed must find
+  and supersede/replace these (by `source_lsn < 0`) rather than assume a clean table, since
+  this is a persistent live DB shared across steps.

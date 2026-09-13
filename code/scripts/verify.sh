@@ -3,15 +3,35 @@
 # "Verification (make verify)" section for the complete target shape):
 #   1. config validation gate
 #   2. full pytest (unit/integration/dags)
-#   3. poll `airflow dags list` for full DAG set
-#   4. run every DAG twice via `airflow dags test`
+#   3. poll `airflow dags list` for the expected DAG set
+#   4. run every generated DAG twice via `airflow dags test` (idempotency)
 #   5. `pytest -m e2e` against the live deriv DB
-# Steps 1 (config validation) and 3-5 are added in later phases once
-# config.py/DAGs exist; Step 1 (harness) only has step 2 (pytest) wired.
+# Step 5 is wired in once tests/e2e/ has actual tests (Step 5+ per TASK.md) —
+# an empty -m e2e run exits nonzero under pytest's "no tests collected" rule,
+# which would fail this script for no real reason before then.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-echo "== running test suite =="
+echo "== 1/4: config validation =="
+docker compose run --rm --no-deps airflow-scheduler python -m deriv_pipeline.config --validate-all
+
+echo "== 2/4: test suite (unit/integration/dags) =="
 docker compose --profile test run --rm tests
 
-echo "== verify: PASS (harness-level checks only so far) =="
+echo "== 3/4: airflow dags list =="
+docker compose run --rm --no-deps airflow-scheduler airflow dags list
+
+echo "== 4/4: airflow dags test (each generated DAG, twice for idempotency) =="
+dag_ids="$(docker compose run --rm --no-deps airflow-scheduler airflow dags list -o plain | tail -n +2 | awk '{print $1}' | grep '^table__' || true)"
+if [ -z "$dag_ids" ]; then
+    echo "verify: FAIL — no table__* DAGs found (airflow dags list produced none)" >&2
+    exit 1
+fi
+for dag_id in $dag_ids; do
+    echo "-- $dag_id (run 1) --"
+    docker compose run --rm --no-deps airflow-scheduler airflow dags test "$dag_id" 2024-03-01
+    echo "-- $dag_id (run 2, idempotency) --"
+    docker compose run --rm --no-deps airflow-scheduler airflow dags test "$dag_id" 2024-03-01
+done
+
+echo "== verify: PASS =="
