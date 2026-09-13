@@ -32,6 +32,12 @@ CONFIG_DIR = Path(os.environ.get("DERIV_CONFIG_DIR") or (REPO_ROOT / "code" / "c
 LAYER3_STRATEGIES = {"dimension_upsert", "fact_upsert", "scd2_apply", "scd2_baseline_seed"}
 TABLE_CONFIG_KINDS = {"table", "derived_dimension", "generated_dimension"}
 
+# fact_upsert's fk_resolution[col] is either one of these two special
+# strings, or a dict (validated below) shaped like dimension_upsert's
+# fk_resolution for a plain dimension lookup.
+_FACT_UPSERT_FK_SENTINELS = {"inferred_member_on_miss", "snapshotted_fk"}
+_FK_RULE_REQUIRED_KEYS = {"from_column", "dim_target", "dim_natural_key", "dim_surrogate_key"}
+
 
 def _load_yaml(path: Path) -> dict:
     raw = yaml.safe_load(Path(path).read_text())
@@ -86,6 +92,14 @@ class Layer3Target:
     # scd2_baseline_seed only: glob (under data/) for the raw CDC source file
     # used to exclude clients whose earliest event is an 'insert' (ADR-2/G2).
     cdc_source_glob: str | None = None
+    # fact_upsert only: the staging column holding this fact's event date —
+    # used both for dim_date resolution and as the risk-snapshot lookup
+    # timestamp (Step 5: generalized off vendor_deposits' original hardcoded
+    # deposit_date so client_deposit/client_trades can reuse the same function).
+    event_date_column: str | None = None
+    # fact_upsert only: target_column -> literal value written on every row
+    # (e.g. source_system) rather than copied from staging.
+    literals: dict[str, str] = field(default_factory=dict)
 
 
 def _build_layer_target(raw: dict, path: Path, label: str) -> LayerTarget:
@@ -154,6 +168,38 @@ class TableConfig:
                 raise ValueError(
                     f"{path}: layer3 strategy scd2_baseline_seed requires cdc_source_glob"
                 )
+            if strategy == "fact_upsert":
+                # Without event_date_column, fact_upsert puts a bare None into
+                # its generated column list and blows up with a confusing
+                # TypeError deep in layer3 at DAG runtime instead of a clear,
+                # path-annotated error at config-load time (Step 5 dual
+                # review finding, confirmed independently by both reviewers).
+                if not entry.get("event_date_column"):
+                    raise ValueError(
+                        f"{path}: layer3 strategy fact_upsert requires event_date_column"
+                    )
+                literals = entry.get("literals", {})
+                if not isinstance(literals, dict):
+                    raise ValueError(
+                        f"{path}: layer3 literals must be a YAML mapping, got {literals!r}"
+                    )
+                for fk_col, rule in entry.get("fk_resolution", {}).items():
+                    if isinstance(rule, dict):
+                        missing = _FK_RULE_REQUIRED_KEYS - rule.keys()
+                        if missing:
+                            raise ValueError(
+                                f"{path}: fk_resolution[{fk_col!r}] missing required"
+                                f" key(s) {sorted(missing)}"
+                            )
+                    elif rule not in _FACT_UPSERT_FK_SENTINELS:
+                        # A typo'd sentinel (e.g. "inferred_member" instead of
+                        # "inferred_member_on_miss") silently flips behavior
+                        # rather than erroring — must be rejected as loudly
+                        # as a missing key (Step 5 dual review finding, Opus).
+                        raise ValueError(
+                            f"{path}: fk_resolution[{fk_col!r}]={rule!r} must be a dict or"
+                            f" one of {sorted(_FACT_UPSERT_FK_SENTINELS)}"
+                        )
             try:
                 columns = _require_str_list(entry, "columns", path, required=False) or None
                 layer3.append(
@@ -163,6 +209,8 @@ class TableConfig:
                         fk_resolution=entry.get("fk_resolution", {}),
                         columns=columns,
                         cdc_source_glob=entry.get("cdc_source_glob"),
+                        event_date_column=entry.get("event_date_column"),
+                        literals=entry.get("literals", {}),
                     )
                 )
             except (TypeError, KeyError) as exc:

@@ -48,6 +48,18 @@ def _resolve_risk_snapshot_key(conn, client_id: str, event_ts: datetime, strateg
             return key
         if strategy != "snapshotted_fk":
             raise ValueError(f"no risk snapshot for client_id={client_id!r} and no fk_resolution rule")
+        # Serialize the read-then-insert stopgap allocation below per
+        # client_id across connections/transactions: once client_deposit and
+        # client_trades (Step 5) both call this concurrently for the same
+        # client at different event dates, two transactions could otherwise
+        # both read the same MIN(source_lsn) via MVCC, compute the same
+        # stopgap_lsn, and have the loser's window silently swallowed by the
+        # ON CONFLICT DO NOTHING below while its own event_ts never gets a
+        # window — surfacing as a spurious "still unresolved" raise with no
+        # real data problem (Step 5 dual review finding, confirmed
+        # independently by both reviewers). Transaction-scoped: released
+        # automatically at commit/rollback, no explicit unlock needed.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"risk_snapshot_stopgap:{client_id}",))
         # Walking-skeleton stand-in for the real, ordered G2 baseline seed
         # (ADR-2, implemented properly as a bootstrap_warehouse step in
         # Step 4). Only seed when this client has ZERO existing REAL
@@ -108,87 +120,107 @@ def _resolve_risk_snapshot_key(conn, client_id: str, event_ts: datetime, strateg
 
 
 def fact_upsert(cfg: TableConfig, layer3_target, conn) -> int:
-    """NOTE: the SELECT/INSERT column lists below are hardcoded to
-    vendor_deposits' staging shape / fact_deposits' fact shape —
-    `layer3_target.columns` is defined in config.py but deliberately unused
-    here. Before a second fact_upsert-strategy table (e.g. client_trades.yml,
-    Step 5+) can reuse this function, it needs to read its column list from
-    `layer3_target.columns` instead of the literals below (Step 3 dual
-    review finding; acceptable as scoped for the Step 3 walking skeleton
-    since only vendor_deposits exists)."""
+    """Generic fact load: `client_key`/`risk_snapshot_key`/`date_key` are
+    always resolved (via `layer3_target.event_date_column`, the staging
+    column holding this fact's event date); `layer3_target.columns` are
+    copied straight across from staging by identical name; any entry in
+    `fk_resolution` whose value is a dict (not one of the two special
+    strings "inferred_member_on_miss"/"snapshotted_fk") resolves that target
+    column via another dimension's natural key, same shape as
+    `dimension_upsert`'s `fk_resolution` (e.g. fact_trades' `instrument_key`);
+    `layer3_target.literals` writes a fixed value per row (e.g.
+    `source_system`) instead of copying one from staging. Generalized off
+    vendor_deposits' original hardcoded shape once client_deposit/
+    client_trades needed to reuse it (Step 5; the hardcoding itself was a
+    flagged, deliberately-deferred finding from Step 3's dual review)."""
     schema, table = split_target(cfg.layer2.target)
     fact_schema, fact_table = split_target(layer3_target.target)
     pk_cols = primary_key_columns(conn, fact_schema, fact_table)
     fk = layer3_target.fk_resolution
+    natural_key_col = cfg.source.natural_key[0]
+    event_date_col = layer3_target.event_date_column
+    plain_cols = layer3_target.columns or []
+    dim_fk_cols = {col: rule for col, rule in fk.items() if isinstance(rule, dict)}
+    literals = layer3_target.literals
 
+    source_cols = sorted(
+        {natural_key_col, "client_id", event_date_col, *plain_cols,
+         *(rule["from_column"] for rule in dim_fk_cols.values())}
+    )
     with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT deposit_id, client_id, deposit_date, amount_usd, exchange_rate, "
-            f"fee_usd, processing_days, payment_method, currency_original, status, "
-            f"is_late_arrival FROM {schema}.{table}"
-        )
+        cur.execute(f"SELECT {', '.join(source_cols)} FROM {schema}.{table}")
         rows = cur.fetchall()
         columns = [d.name for d in cur.description]
+
+    # dict.fromkeys dedupes while preserving order: source_cols is a deduped
+    # set, but this list is a flat concatenation, so a config where a
+    # `columns`/`literals`/dim_fk_cols entry collides with another (or with
+    # one of the four always-present generated keys) would otherwise emit
+    # the same column twice in the INSERT and get rejected by postgres
+    # (Step 5 dual review finding).
+    insert_cols = list(dict.fromkeys([
+        natural_key_col, "client_key", "risk_snapshot_key", "date_key", event_date_col,
+        *plain_cols, *dim_fk_cols.keys(), *literals.keys(),
+    ]))
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in insert_cols if c not in pk_cols)
+    placeholders = ", ".join(f"%({c})s" for c in insert_cols)
 
     loaded = 0
     for row in rows:
         r = dict(zip(columns, row))
-        event_ts = datetime.combine(r["deposit_date"], datetime.min.time(), tzinfo=timezone.utc)
+        event_date = r[event_date_col]
+        event_ts = datetime.combine(event_date, datetime.min.time(), tzinfo=timezone.utc)
         client_key = _resolve_client_key(conn, r["client_id"], fk.get("dim_client"))
         risk_snapshot_key = _resolve_risk_snapshot_key(
             conn, r["client_id"], event_ts, fk.get("risk_snapshot")
         )
-        date_key = ensure_date(conn, r["deposit_date"])
+        date_key = ensure_date(conn, event_date)
 
+        values = {
+            natural_key_col: r[natural_key_col],
+            "client_key": client_key,
+            "risk_snapshot_key": risk_snapshot_key,
+            "date_key": date_key,
+            event_date_col: event_date,
+            **{c: r[c] for c in plain_cols},
+            **{
+                col: _resolve_dimension_fk(
+                    conn, rule["dim_target"], rule["dim_natural_key"],
+                    rule["dim_surrogate_key"], r[rule["from_column"]],
+                    nullable=rule.get("nullable", True),
+                )
+                for col, rule in dim_fk_cols.items()
+            },
+            **literals,
+        }
         with conn.cursor() as cur:
             cur.execute(
-                f"""
-                INSERT INTO {fact_schema}.{fact_table}
-                    (deposit_id, client_key, risk_snapshot_key, date_key, deposit_date,
-                     amount_usd, exchange_rate, fee_usd, processing_days, payment_method,
-                     currency_original, status, source_system, is_late_arrival)
-                VALUES (%(deposit_id)s, %(client_key)s, %(risk_snapshot_key)s, %(date_key)s,
-                        %(deposit_date)s, %(amount_usd)s, %(exchange_rate)s, %(fee_usd)s,
-                        %(processing_days)s, %(payment_method)s, %(currency_original)s,
-                        %(status)s, 'vendor', %(is_late_arrival)s)
-                ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET
-                    client_key = EXCLUDED.client_key,
-                    risk_snapshot_key = EXCLUDED.risk_snapshot_key,
-                    date_key = EXCLUDED.date_key,
-                    amount_usd = EXCLUDED.amount_usd,
-                    exchange_rate = EXCLUDED.exchange_rate,
-                    fee_usd = EXCLUDED.fee_usd,
-                    processing_days = EXCLUDED.processing_days,
-                    payment_method = EXCLUDED.payment_method,
-                    currency_original = EXCLUDED.currency_original,
-                    status = EXCLUDED.status,
-                    is_late_arrival = EXCLUDED.is_late_arrival
-                """,
-                {
-                    "deposit_id": r["deposit_id"],
-                    "client_key": client_key,
-                    "risk_snapshot_key": risk_snapshot_key,
-                    "date_key": date_key,
-                    "deposit_date": r["deposit_date"],
-                    "amount_usd": r["amount_usd"],
-                    "exchange_rate": r["exchange_rate"],
-                    "fee_usd": r["fee_usd"],
-                    "processing_days": r["processing_days"],
-                    "payment_method": r["payment_method"],
-                    "currency_original": r["currency_original"],
-                    "status": r["status"],
-                    "is_late_arrival": r["is_late_arrival"],
-                },
+                f"INSERT INTO {fact_schema}.{fact_table} ({', '.join(insert_cols)}) "
+                f"VALUES ({placeholders}) "
+                f"ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET {set_clause}",
+                values,
             )
         loaded += 1
     return loaded
 
 
-def _resolve_dimension_fk(conn, dim_target: str, dim_natural_key: str, dim_surrogate_key: str, value):
+def _resolve_dimension_fk(
+    conn, dim_target: str, dim_natural_key: str, dim_surrogate_key: str, value, *, nullable: bool = True,
+):
     if value is None:
         # A NULL source value (e.g. no assigned_manager) means "no FK", not
         # "lookup failed" — dim_client's manager_key is a nullable FK
-        # precisely for this case (Step 4 dual review finding).
+        # precisely for this case (Step 4 dual review finding). But this
+        # helper is now also reused (Step 5) for NOT NULL fact FKs (e.g.
+        # fact_trades.instrument_key) where a NULL source value must raise a
+        # clear, diagnostic error here rather than bypass it and surface as
+        # a bare NotNullViolation from the INSERT (Step 5 dual review
+        # finding) — callers opt into that via `nullable=False`.
+        if not nullable:
+            raise ValueError(
+                f"no source value to resolve {dim_target}'s FK (nullable=False for this rule) —"
+                f" check the staging row's source column for a missing/unmapped value"
+            )
         return None
     dim_schema, dim_table = split_target(dim_target)
     with conn.cursor() as cur:
@@ -199,7 +231,7 @@ def _resolve_dimension_fk(conn, dim_target: str, dim_natural_key: str, dim_surro
         row = cur.fetchone()
     if row is None:
         raise ValueError(
-            f"dimension_upsert: no {dim_target} row with {dim_natural_key}={value!r} — "
+            f"no {dim_target} row with {dim_natural_key}={value!r} — "
             f"check bootstrap_warehouse task ordering (the referenced dimension must load first)"
         )
     return row[0]

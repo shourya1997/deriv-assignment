@@ -1,0 +1,44 @@
+kind: table
+name: client_trades
+source:
+  format: json
+  glob: "client_trades.json"
+  natural_key: [trade_id]
+  expected_columns: [trade_id, client_id, trade_date, instrument, direction, volume_lots,
+                      open_price, close_price, pnl_usd, trade_status]
+layer1: {target: raw.client_trades}
+layer2:
+  target: staging.client_trades
+  conflict_strategy: upsert_do_update
+  update_columns: [trade_status, pnl_usd]
+layer3:
+  - target: warehouse.fact_trades
+    strategy: fact_upsert
+    columns: [direction, volume_lots, open_price, close_price, pnl_usd, trade_status]
+    event_date_column: trade_date
+    fk_resolution:
+      dim_client: inferred_member_on_miss
+      risk_snapshot: snapshotted_fk
+      instrument_key:
+        from_column: instrument
+        dim_target: warehouse.dim_instrument
+        dim_natural_key: instrument_name
+        dim_surrogate_key: instrument_key
+        # fact_trades.instrument_key is NOT NULL — a trade with a missing
+        # instrument must raise loudly, not silently degrade to NULL and
+        # crash later on a constraint violation (Step 5 dual review finding).
+        nullable: false
+orchestration:
+  schedule: "@daily"
+  start_date: "2024-01-01"
+  catchup: false
+  tags: [client]
+  # Unlike client_deposit/vendor_deposits (self-sufficient: dim_client and
+  # dim_date rows are created on demand), this table's instrument_key
+  # fk_resolution is a hard, non-creatable prerequisite on warehouse
+  # .dim_instrument, which only bootstrap_warehouse populates. bootstrap
+  # _warehouse is schedule=None (manual/one-time), so nothing otherwise
+  # orders this @daily DAG after it — on a fresh deploy this table's very
+  # first run would raise "no warehouse.dim_instrument row" (Step 5 dual
+  # review finding, confirmed independently by both reviewers).
+  requires_dim_instrument: true

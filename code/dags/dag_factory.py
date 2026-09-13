@@ -15,6 +15,7 @@ from datetime import datetime
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.sensors.python import PythonSensor
 
 from deriv_pipeline.config import TableConfig
 from deriv_pipeline.db import get_connection
@@ -35,6 +36,20 @@ def _run(fn, cfg):
 
 def _noop_dq_checks(cfg):
     """Placeholder until Step 8 (Great Expectations + SQL-assertion DQ)."""
+
+
+def _dim_instrument_populated() -> bool:
+    """Polled by wait_for_dim_instrument below — a data-condition check
+    rather than an ExternalTaskSensor, since bootstrap_warehouse is
+    schedule=None (manual, run-once) and has no comparable execution_date to
+    match against this DAG's own @daily schedule."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT EXISTS(SELECT 1 FROM warehouse.dim_instrument)")
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
 
 
 def _make_dag(cfg: TableConfig) -> DAG:
@@ -58,6 +73,20 @@ def _make_dag(cfg: TableConfig) -> DAG:
         load_layer3 = PythonOperator(
             task_id="load_layer3", python_callable=lambda: _run(layer3_warehouse.load, cfg)
         )
+        # This table's fact_upsert has a hard (non-creatable-on-demand) FK
+        # prerequisite on warehouse.dim_instrument, which only
+        # bootstrap_warehouse populates — without this, a fresh deploy's
+        # first @daily run races bootstrap_warehouse and can fail (Step 5
+        # dual review finding, confirmed independently by both reviewers).
+        if orch.get("requires_dim_instrument"):
+            wait_for_dim_instrument = PythonSensor(
+                task_id="wait_for_dim_instrument",
+                python_callable=_dim_instrument_populated,
+                poke_interval=30,
+                timeout=3600,
+                mode="reschedule",
+            )
+            wait_for_dim_instrument >> land_layer1
         land_layer1 >> stage_layer2 >> run_dq_checks >> load_layer3
     return dag
 

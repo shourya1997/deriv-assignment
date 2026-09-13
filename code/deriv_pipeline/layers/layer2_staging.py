@@ -28,15 +28,23 @@ def stage(cfg: TableConfig, conn) -> int:
     pk_cols = primary_key_columns(conn, schema, table)
     update_columns = cfg.layer2.update_columns or []
 
-    # header resolution is per source_file (drift is a property of that
-    # file's header, not of any individual row).
-    header_cache: dict[str, tuple[dict[str, str], bool]] = {}
+    # Cached by the row's own key set, not by source_file: a CSV file has one
+    # physical header shared by every row, so this coincides with "per file"
+    # for CSV sources — but a JSON array has no shared header line, and rows
+    # within the same file can carry different key sets (e.g. client_deposit
+    # .json's DEP012 uses `credit_card` where every other row uses
+    # `payment_method`). Keying the cache on source_file alone would resolve
+    # every row in that file using whichever row happened to be seen first,
+    # silently misclassifying the rest (Step 5 finding, caught by
+    # test_client_deposit_loads_into_shared_fact_deposits_as_internal).
+    header_cache: dict[frozenset[str], tuple[dict[str, str], bool]] = {}
 
     for source_file, payload in raw_rows:
-        if source_file not in header_cache:
+        cache_key = frozenset(payload.keys())
+        if cache_key not in header_cache:
             resolved = resolve_header(list(payload.keys()), cfg.source.expected_columns, cfg.source.aliases)
-            header_cache[source_file] = (resolved.colmap, resolved.schema_drift_detected)
-        colmap, schema_drift_detected = header_cache[source_file]
+            header_cache[cache_key] = (resolved.colmap, resolved.schema_drift_detected)
+        colmap, schema_drift_detected = header_cache[cache_key]
 
         row_out: dict[str, str] = {}
         for observed, canonical in colmap.items():

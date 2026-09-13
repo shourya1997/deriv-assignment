@@ -8,7 +8,7 @@ Full spec: `/Users/shouryasengupta/.claude/plans/compiled-wobbling-quilt.md`.
 - [x] Step 2 — config schema (fixture-driven tests) + one real config (vendor_deposits.yml)
 - [x] Step 3 — walking skeleton: vendor_deposits end-to-end (layer1→2→3, one generated DAG, `make verify` green)
 - [x] Step 4 — dimensions properly (dim_manager/dim_instrument/dim_date, client_signup/client_profile) + G2 baseline seed
-- [ ] Step 5 — add client_deposit.yml, client_trades.yml
+- [x] Step 5 — add client_deposit.yml, client_trades.yml
 - [ ] Step 6 — add client_profile_changes.yml (scd2_apply / CDC)
 - [ ] Step 7 — historical reload (cdc_historical_reload DAG)
 - [ ] Step 8 — Great Expectations (one real suite) + SQL-assertion DQ for the rest

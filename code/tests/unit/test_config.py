@@ -112,6 +112,7 @@ def test_all_shipped_configs_validate():
     assert "vendor_deposits" in names
     for expected in (
         "client_signup", "client_profile", "dim_manager", "dim_instrument", "dim_date",
+        "client_deposit", "client_trades",
     ):
         assert expected in names
 
@@ -183,6 +184,83 @@ def test_rejects_scd2_baseline_seed_without_cdc_source_glob(tmp_path):
         "layer3:\n  - {target: warehouse.dim_client_risk_snapshot, strategy: scd2_baseline_seed}\n"
     )
     with pytest.raises(ValueError, match="cdc_source_glob"):
+        TableConfig.load(path)
+
+
+def test_rejects_fact_upsert_without_event_date_column(tmp_path):
+    """Without event_date_column, fact_upsert puts a bare None into its
+    generated column list and raises a confusing TypeError deep in layer3 at
+    DAG runtime instead of failing loudly at config-load time (Step 5 dual
+    review finding)."""
+    from deriv_pipeline.config import TableConfig
+
+    path = tmp_path / "bad_fact_upsert.yml"
+    path.write_text(
+        "kind: table\nname: bad\n"
+        "source: {format: json, glob: 'x.json', natural_key: [x_id]}\n"
+        "layer1: {target: raw.x}\nlayer2: {target: staging.x}\n"
+        "layer3:\n  - {target: warehouse.fact_x, strategy: fact_upsert}\n"
+    )
+    with pytest.raises(ValueError, match="event_date_column"):
+        TableConfig.load(path)
+
+
+def test_rejects_fact_upsert_literals_as_scalar(tmp_path):
+    """literals: source_system (missing braces) is the same scalar-vs-list
+    footgun _require_str_list already guards against elsewhere — must be
+    rejected as loudly, not silently treated as truthy and misused as a dict
+    later (`literals.keys()`/`**literals` would raise a confusing
+    AttributeError deep in fact_upsert instead)."""
+    from deriv_pipeline.config import TableConfig
+
+    path = tmp_path / "bad_literals.yml"
+    path.write_text(
+        "kind: table\nname: bad\n"
+        "source: {format: json, glob: 'x.json', natural_key: [x_id]}\n"
+        "layer1: {target: raw.x}\nlayer2: {target: staging.x}\n"
+        "layer3:\n  - {target: warehouse.fact_x, strategy: fact_upsert,"
+        " event_date_column: x_date, literals: source_system}\n"
+    )
+    with pytest.raises(ValueError, match="literals"):
+        TableConfig.load(path)
+
+
+def test_rejects_fact_upsert_dict_fk_resolution_missing_keys(tmp_path):
+    """A dict-shaped fk_resolution rule missing one of its four required
+    keys must fail at config-load time with a clear message, not a bare
+    KeyError deep inside fact_upsert at DAG runtime."""
+    from deriv_pipeline.config import TableConfig
+
+    path = tmp_path / "bad_fk_rule.yml"
+    path.write_text(
+        "kind: table\nname: bad\n"
+        "source: {format: json, glob: 'x.json', natural_key: [x_id]}\n"
+        "layer1: {target: raw.x}\nlayer2: {target: staging.x}\n"
+        "layer3:\n  - target: warehouse.fact_x\n    strategy: fact_upsert\n"
+        "    event_date_column: x_date\n"
+        "    fk_resolution:\n      instrument_key: {from_column: instrument}\n"
+    )
+    with pytest.raises(ValueError, match="fk_resolution"):
+        TableConfig.load(path)
+
+
+def test_rejects_fact_upsert_fk_resolution_typo_sentinel(tmp_path):
+    """A typo'd sentinel (e.g. "inferred_member" instead of
+    "inferred_member_on_miss") must not be silently accepted — it would
+    silently flip fact_upsert's behavior from "create an inferred stub" to
+    "raise on any unknown client" with no error at config-load time (Step 5
+    dual review finding, Opus)."""
+    from deriv_pipeline.config import TableConfig
+
+    path = tmp_path / "bad_sentinel.yml"
+    path.write_text(
+        "kind: table\nname: bad\n"
+        "source: {format: json, glob: 'x.json', natural_key: [x_id]}\n"
+        "layer1: {target: raw.x}\nlayer2: {target: staging.x}\n"
+        "layer3:\n  - {target: warehouse.fact_x, strategy: fact_upsert,"
+        " event_date_column: x_date, fk_resolution: {dim_client: inferred_member}}\n"
+    )
+    with pytest.raises(ValueError, match="fk_resolution"):
         TableConfig.load(path)
 
 

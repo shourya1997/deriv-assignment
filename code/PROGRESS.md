@@ -277,3 +277,88 @@ repo actually in" independent of git history.
   `staging.` schema prefix instead of resolving the referenced config's real `layer2.target`
   (Opus, latent forward-compat gap); hard-fail on an unmapped `derived_columns` value (Opus,
   deliberate fail-loud behavior per project convention, not a bug).
+
+## Step 5 — client_deposit.yml, client_trades.yml
+
+- Generalized `layers/layer3_warehouse.py::fact_upsert` off vendor_deposits' Step 3 hardcoded
+  column shape (a documented, deliberately-deferred finding) into a fully config-driven
+  strategy, via two new `Layer3Target` fields — `event_date_column` (the staging column used
+  both for `dim_date` resolution and as the risk-snapshot lookup timestamp) and `literals`
+  (target_column → fixed value per row, e.g. `source_system`) — plus extending `fk_resolution`
+  entries to accept a dict shape (`from_column`/`dim_target`/`dim_natural_key`/
+  `dim_surrogate_key`, reusing `dimension_upsert`'s `_resolve_dimension_fk`) alongside the two
+  existing special strings.
+- Added `client_deposit.yml` (JSON source, shares `warehouse.fact_deposits` with
+  `vendor_deposits` via a `source_system` literal and disjoint `deposit_id` natural keys) and
+  `client_trades.yml` (JSON source, new `warehouse.fact_trades` target, resolves
+  `instrument_key` via the new dict-shaped `fk_resolution` against `dim_instrument`).
+- **Found and fixed via TDD** (not a deferred/documented finding — caught by a failing test in
+  this phase's own red-green cycle): `layers/layer2_staging.py`'s header-resolution cache was
+  keyed by `source_file`, correct for CSV (one physical header per file) but wrong for JSON,
+  which has no shared header line — `client_deposit.json`'s `DEP012` row uses `credit_card`
+  where every other row in the same file uses `payment_method`, and the per-file cache silently
+  misclassified every row using whichever header was cached first. Fixed by rekeying on
+  `frozenset(payload.keys())` (the row's own key set) instead — a strict generalization,
+  identical behavior for CSV, correct for JSON's per-row heterogeneity.
+- Added `tests/integration/test_client_deposit_and_trades_pipeline.py` (5 tests, incl. the
+  vendor/internal `fact_deposits` coexistence check and a NULL-`instrument` negative test added
+  post-review) and extended `test_config.py`'s shipped-config name list.
+- Full suite: 86/86 passing. `scripts/verify.sh`: PASS end-to-end.
+
+**Dual review (Opus + Sonnet)** — first attempt: both agents hit a session-wide rate limit
+(HTTP 429) before producing findings; retried after reset. Second attempt used `isolation:
+worktree` for both agents, which silently gave them a checkout with no uncommitted diff (and,
+for the Sonnet agent, no `code/` tree at all) — both would have rubber-stamped nothing found
+had the Sonnet agent not refused to fabricate a review instead. Retried a third time without
+worktree isolation; both agents then reviewed the real diff and converged independently on the
+same central finding. **Fixes applied**, see ADR-9 for full detail:
+  - **Cross-DAG stopgap-lsn race (both reviewers, independently, highest confidence)** —
+    `_resolve_risk_snapshot_key`'s stopgap allocation is a read-then-insert with no lock;
+    `client_deposit.yml`/`client_trades.yml` are independent `@daily` DAGs with no edge between
+    them, and 17 of ~20 shared `client_id`s have different event dates between the two feeds —
+    concurrent runs could both compute the same `stopgap_lsn` and have the loser's window
+    silently dropped by `ON CONFLICT DO NOTHING`, then raise a spurious "still unresolved"
+    error. Fixed with `pg_advisory_xact_lock(hashtext(...))` serializing the allocation per
+    `client_id`, transaction-scoped (no explicit unlock needed).
+  - **`bootstrap_warehouse` sequencing reasoning was factually wrong (Opus)** — the premise
+    "these tables only read shared dims" is false (`fact_upsert` does insert into `dim_client`
+    and `dim_client_risk_snapshot`); it happens to be safe there only because both are
+    idempotent `ON CONFLICT DO NOTHING`s. The real gap is `client_trades`' hard, non-creatable
+    prerequisite on `warehouse.dim_instrument` (only `bootstrap_warehouse` populates it, which
+    is `schedule=None`/manual, with no edge to the `@daily` generated DAGs) — on a fresh deploy
+    the first run would raise. Fixed: new `orchestration.requires_dim_instrument: true` flag on
+    `client_trades.yml`, honored by `dag_factory.py` via a `PythonSensor` (`mode="reschedule"`)
+    polling `dim_instrument`'s existence before `land_layer1` — an `ExternalTaskSensor` wasn't
+    viable since `bootstrap_warehouse` has no comparable `execution_date` to match against.
+  - **NULL semantics reused from a nullable FK for a NOT NULL one (both reviewers)** —
+    `_resolve_dimension_fk`'s `None → None` short-circuit was written for `dim_client
+    .manager_key` (nullable); reusing it unguarded for `fact_trades.instrument_key` (NOT NULL)
+    meant a trade with a missing instrument silently staged as NULL and crashed later on a bare
+    `NotNullViolation`. Fixed: the helper gained a `nullable: bool = True` keyword (default
+    preserves existing `dimension_upsert` behavior), and `client_trades.yml`'s `instrument_key`
+    rule sets `nullable: false` to raise a clear, diagnostic error instead.
+  - **Missing config-load-time validation for `fact_upsert`'s three new shapes (both
+    reviewers)** — a missing `event_date_column` crashed with a bare `TypeError` deep in
+    `fact_upsert` at DAG runtime; a scalar `literals` crashed with `AttributeError`; a dict
+    `fk_resolution` rule missing a key crashed with `KeyError`; a typo'd sentinel string (e.g.
+    `inferred_member` instead of `inferred_member_on_miss`) silently flipped behavior with no
+    error at all. Fixed: `config.py`'s `TableConfig.load()` now validates all four cases for
+    `strategy: fact_upsert` entries at config-load time, matching the existing
+    `scd2_baseline_seed`/`cdc_source_glob` pattern. Added 4 negative unit tests.
+  - **`insert_cols` built by flat concatenation, not deduped like `source_cols` (Opus)** — any
+    config overlap (e.g. a `columns` entry colliding with a `literals` key or a generated key
+    name) would emit the same column twice in the INSERT and be rejected by postgres. Fixed:
+    `list(dict.fromkeys(...))`, the same idiom already used in `layer2_staging.py` for the same
+    reason. Not currently triggered by any shipped config, but the function is now fully generic.
+  - Misleading error message: `_resolve_dimension_fk`'s "no such row" raise said
+    `"dimension_upsert: ..."` unconditionally, which is wrong when the raise comes from
+    `fact_upsert` (Opus) — fixed to a caller-agnostic message.
+- **Deferred as accepted limitations** (documented in ADR-9, not fixed this phase): NULL literal
+  defeating a fact column's `DEFAULT` (Opus, no shipped config's data exercises it — all-columns
+  INSERT behavior may be revisited if a future config needs it); `event_date_column`'s dual use
+  for both `dim_date` and the risk-snapshot timestamp silently truncating time-of-day if ever
+  pointed at a `timestamptz` column, and the CDC-era one-day-staleness risk that creates once
+  Step 6 lands real CDC (Opus, architecturally latent, not reachable by any current config);
+  unenforced disjoint-`deposit_id` assumption between `vendor_deposits`/`client_deposit` sharing
+  `fact_deposits` (Opus, no shipped data collides, `ReconciliationConfig` exists for this exact
+  pair but isn't wired to enforce it until Step 9).

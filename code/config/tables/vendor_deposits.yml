@@ -17,5 +17,9 @@ layer2: {target: staging.vendor_deposits, conflict_strategy: upsert_do_update,
 layer3:
   - target: warehouse.fact_deposits
     strategy: fact_upsert
+    columns: [amount_usd, exchange_rate, fee_usd, processing_days, payment_method,
+              currency_original, status, is_late_arrival]
+    event_date_column: deposit_date
+    literals: {source_system: vendor}
     fk_resolution: {dim_client: inferred_member_on_miss, risk_snapshot: snapshotted_fk}
 orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [vendor]}

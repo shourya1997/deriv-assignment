@@ -250,3 +250,106 @@ invariant, restated from ADR-7) — the baseline seed, including the orphan-clie
 must exist before any `apply_cdc_event` call. The `source_lsn > 0` guard added in decision 4
 means `scd2_baseline_seed` becomes a safe no-op once Step 6 lands, rather than needing to be
 disabled or special-cased.
+
+## ADR-9 — Step 5: generic `fact_upsert`, shared `fact_deposits`, and cross-DAG stopgap safety
+
+**Context:** Step 5 onboards `client_deposit`/`client_trades` as the second and third callers of
+`fact_upsert`, which Step 3's dual review flagged (and deliberately deferred) as hardcoded to
+`vendor_deposits`' exact column shape. Generalizing it surfaces real interactions between
+independently-scheduled `@daily` DAGs that a single-caller function never exercised.
+
+**Decisions:**
+1. **Generalize via two new `Layer3Target` fields, not a second strategy.** `event_date_column`
+   names the staging column driving both `dim_date` resolution and the risk-snapshot lookup
+   timestamp; `literals` writes a fixed per-row value (e.g. `source_system`) instead of copying
+   one from staging. `fk_resolution` entries may now be a dict shaped like `dimension_upsert`'s
+   (`from_column`/`dim_target`/`dim_natural_key`/`dim_surrogate_key`), reusing
+   `_resolve_dimension_fk`, alongside the two existing special strings
+   (`inferred_member_on_miss`/`snapshotted_fk`). One generic function, config expresses the
+   variation — consistent with ADR-1's overall config-driven design.
+2. **Shared `warehouse.fact_deposits`, disjoint natural keys, not per-source fact tables.**
+   `client_deposit.yml` and `vendor_deposits.yml` both target `fact_deposits`, distinguished by a
+   `literals: {source_system: ...}` entry and disjoint `deposit_id` prefixes (`DEP*` vs `VDEP*`).
+   Mirrors Step 4's shared-`dim_client` pattern, but here each source owns whole rows rather than
+   disjoint columns of the same row, so (unlike client_signup/client_profile) no DAG-ordering
+   edge is needed between the two — verified no shipped id collides (decision 6 covers the
+   unenforced general case).
+3. **`_resolve_dimension_fk` gains an explicit `nullable` keyword, default `True`.** The
+   function's original `None → None` short-circuit was written for `dim_client.manager_key`
+   (genuinely nullable); reusing it unguarded for `fact_trades.instrument_key` (`NOT NULL`) let a
+   trade with a missing instrument stage as a silent NULL and crash later on a bare
+   `NotNullViolation` instead of a clear diagnostic (Step 5 dual review finding, both reviewers).
+   Default `True` preserves `dimension_upsert`'s existing behavior with no config change;
+   `client_trades.yml`'s `instrument_key` rule sets `nullable: false`.
+4. **Cross-DAG stopgap-lsn allocation is now lock-guarded, not just single-writer-assumed.**
+   `_resolve_risk_snapshot_key`'s stopgap path (ADR-7) was written when `fact_upsert` had exactly
+   one caller, each DAG run serializing its own rows through one connection — no concurrent
+   writer was reachable. Step 5 adds two more independent `@daily` DAGs with overlapping
+   `client_id`s and differing event dates between feeds, making the read-then-insert allocation
+   a real, independently-confirmed race (both reviewers — see fix below). Chose
+   `pg_advisory_xact_lock(hashtext(client_id))` over restructuring the DAG graph: it fixes the
+   race unconditionally regardless of scheduling, is transaction-scoped (auto-released, no
+   explicit unlock), and doesn't require synchronizing `client_deposit`/`client_trades` against
+   each other the way client_signup/client_profile's *column*-level race required in Step 4 —
+   this is a *row*-level allocation race, orthogonal to schedule/DAG topology.
+5. **`client_trades` gets an explicit `requires_dim_instrument` orchestration flag, honored by a
+   `PythonSensor`, not an `ExternalTaskSensor` on `bootstrap_warehouse`.** Unlike
+   `vendor_deposits`/`client_deposit` (fully self-sufficient: `dim_client`/`dim_date` rows are
+   created on demand), `client_trades`' `instrument_key` fk_resolution is a hard,
+   non-creatable-on-demand prerequisite on `warehouse.dim_instrument`, populated only by
+   `bootstrap_warehouse` — which is `schedule=None` (manual/run-once) and has no comparable
+   `execution_date` for an `ExternalTaskSensor` to match against this DAG's own `@daily` runs.
+   Instead, `dag_factory.py` reads a new `orchestration.requires_dim_instrument: true` flag and
+   prepends a `PythonSensor` (`mode="reschedule"`) polling `SELECT EXISTS(SELECT 1 FROM
+   warehouse.dim_instrument)` before `land_layer1`. This was the concrete gap behind an
+   initially-wrong premise: the plan going into this step was "these tables only read
+   already-bootstrapped dims, so `bootstrap_warehouse` needs no changes" — true for `dim_client`
+   (idempotent `ON CONFLICT DO NOTHING`), but false in the sense that mattered: `dim_instrument`
+   isn't creatable on demand at all (Opus dual-review finding).
+6. **Config-load-time validation added for all three new `fact_upsert` shapes.** Mirroring the
+   existing `scd2_baseline_seed`/`cdc_source_glob` pattern: `event_date_column` is now required
+   (a missing one previously crashed with a bare `TypeError` deep in `fact_upsert` at DAG
+   runtime); `literals` must be a YAML mapping (a scalar previously crashed with
+   `AttributeError`); each dict-shaped `fk_resolution` rule must carry all four required keys (a
+   missing one previously crashed with `KeyError`); and a non-dict `fk_resolution` value must be
+   one of the two known sentinel strings (a typo, e.g. `inferred_member` instead of
+   `inferred_member_on_miss`, previously silently flipped behavior with no error at all — the
+   most severe of the four, since it fails silently rather than loudly) (both reviewers).
+
+**Dual review (Opus + Sonnet) process note:** the first attempt (both agents) hit a
+session-wide rate limit before producing findings and was retried after reset. The retry used
+`isolation: worktree` for both agents, which silently handed them a checkout missing the
+uncommitted Step 5 diff entirely (and, for the Sonnet agent, no `code/` tree at all — a worktree
+built from a state that predates this repo's own Step 1) — the Sonnet agent correctly refused to
+fabricate findings against files it couldn't read rather than rubber-stamp the diff; had it not,
+this would have been a false "nothing found" clean bill. Retried a third time without worktree
+isolation, both agents then reviewed the actual diff and converged independently on the same
+central findings (decisions 3-5 above) — noted here as a process lesson: `isolation: worktree`
+is unsafe for reviewing *uncommitted* changes and should not be used for that again.
+
+**Fixes applied:** see decisions 3-6 above (nullable FK semantics, advisory-lock stopgap
+allocation, `requires_dim_instrument` sensor, config-load-time validation); `insert_cols` in
+`fact_upsert` was built by flat list concatenation while `source_cols` was a deduped set — any
+config overlap (e.g. a `columns` entry colliding with a `literals` key) would emit a column
+twice in the generated INSERT and be rejected by postgres (Opus) — fixed with
+`list(dict.fromkeys(...))`, the same idiom `layer2_staging.py` already uses for the identical
+reason; `_resolve_dimension_fk`'s "no such row" error unconditionally said `"dimension_upsert:
+..."`, misleading when raised from `fact_upsert` (Opus) — fixed to a caller-agnostic message.
+
+**Deferred (accepted limitations, not fixed this phase):** a NULL value for a fact column with a
+`DEFAULT` (e.g. `fact_deposits.fee_usd DEFAULT 0`) is still inserted as an explicit NULL rather
+than letting the DEFAULT fire, since `fact_upsert` always lists every configured column — no
+shipped source data exercises this (Opus); `event_date_column`'s dual use for both `dim_date`
+and the risk-snapshot timestamp silently truncates time-of-day via `datetime.combine` if ever
+pointed at a `timestamptz` column instead of a `date` column, and the same coupling becomes a
+systematic one-day-staleness risk once Step 6's real CDC can change `valid_from` intraday (Opus)
+— not reachable by any current config, revisit if a future table needs the two to diverge;
+`vendor_deposits`/`client_deposit`'s shared-`fact_deposits` disjoint-`deposit_id` assumption is
+unenforced — a colliding id between the two feeds would silently flip that row's `source_system`
+and overwrite its measures via the generated `ON CONFLICT DO UPDATE` (Opus) — `Reconciliation
+Config` already models this exact pair but isn't wired to enforce anything until Step 9.
+
+**Consequences:** any future `fact_upsert` caller with a hard, non-creatable dimension
+prerequisite (like `dim_instrument`) should follow decision 5's `requires_dim_instrument`-style
+pattern rather than assuming `bootstrap_warehouse` ordering happens to work out; any future
+`fact_upsert` caller with a NOT NULL dict-shaped FK should set `nullable: false` on that rule.
