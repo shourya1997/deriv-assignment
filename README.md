@@ -28,3 +28,12 @@ The full assignment brief is in [ASSIGNMENT.md](ASSIGNMENT.md).
 
 See [PROMPTS.md](PROMPTS.md) for the full reasoning behind each of these and every
 downstream decision.
+
+## Status
+
+- `README.md`, `PROMPTS.md`, `part1_pipeline.md`, `part2_data_model.md`,
+  `part3_architecture.md`, and `sql/` — **done**, satisfy every MUST COMPLETE and VALIDATION
+  requirement in [ASSIGNMENT.md](ASSIGNMENT.md).
+- `code/` (optional runnable prototype) — **not started yet**, deferred by design. When
+  built, it should load `data/` into a local Postgres and exercise the idempotency,
+  watermark, and SCD2 logic from `sql/` for real, not just as documentation.
