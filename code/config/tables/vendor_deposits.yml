@@ -1,0 +1,21 @@
+kind: table
+name: vendor_deposits
+source:
+  format: csv
+  glob: "deposits_vendor_*.csv"
+  natural_key: [deposit_id]
+  expected_columns: [deposit_id, client_id, deposit_date, amount_usd, payment_method,
+                      currency_original, exchange_rate, status, processing_days, fee_usd]
+  aliases: {method: payment_method}
+  late_arrival:
+    delivery_date: {from: filename, pattern: 'deposits_vendor_(\d{8})\.csv'}
+    event_date_col: deposit_date
+    threshold_days: 2
+layer1: {target: raw.vendor_deposits}
+layer2: {target: staging.vendor_deposits, conflict_strategy: upsert_do_update,
+         update_columns: [status, fee_usd], ge_suite: staging_vendor_deposits}
+layer3:
+  - target: warehouse.fact_deposits
+    strategy: fact_upsert
+    fk_resolution: {dim_client: inferred_member_on_miss, risk_snapshot: snapshotted_fk}
+orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [vendor]}

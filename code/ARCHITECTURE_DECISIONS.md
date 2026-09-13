@@ -93,3 +93,36 @@ exist).
 being fully initialized (not just accepting connections) must declare `postgres:
 condition: service_healthy` explicitly — YAML anchors do not deep-merge, so an overridden
 `depends_on` block silently drops it if omitted (this exact bug hit 3 services in Step 1).
+
+## ADR-6 — Step 2 config-loader fail-loud invariants
+
+**Context:** dual review (Opus + Sonnet) independently converged on the same core risk in
+`deriv_pipeline/config.py`: a config-driven pipeline's single biggest failure mode is a
+broken/misspelled config file failing *silently* — passing `--validate-all`, then simply
+producing no DAG or corrupting data downstream — since the whole point of the design is that
+these YAML files are the only per-table code most future changes will touch.
+**Decision — three invariants, enforced from Step 2 onward and binding on every future config
+loader:**
+1. Every field documented as a YAML list (`natural_key`, `expected_columns`,
+   `update_columns`, `layer3[].columns`) must be validated as an actual list of strings, not
+   merely truthy — a bare `if not value` accepts a scalar string and silently produces
+   per-character iteration downstream.
+2. Every raised error must include the source file's path. A raw `TypeError`/`KeyError` from
+   unpacking a YAML dict into a dataclass is caught and re-raised as `ValueError(f"{path}:
+   ...")` — `airflow-init`'s one-shot container log is the *only* diagnostic surface on a
+   broken deploy, so an error without a filename is not actionable.
+3. "Zero configs found" and "an unrecognized/typo'd `kind`" must be load-time errors, never
+   silently-empty success — `validate_all()` raises if `config/tables/*.yml` yields nothing,
+   and the single `_load_all_table_dir()` dispatch raises on any file whose `kind` isn't in
+   the known set (previously, three independent per-kind filters simply skipped a file with a
+   bad `kind`, which is a config-driven pipeline's worst possible failure mode: green
+   validation, missing pipeline).
+**Alternatives considered:** leaving type-checking to whatever consumes `TableConfig` later
+(rejected — pushes a load-time bug to a runtime failure deep inside the layer engine, with a
+much worse error message); logging a warning on an unknown `kind` instead of raising (rejected
+— warnings in a one-shot init container's scrollback are not a reliable gate, per the same
+"only diagnostic signal" reasoning as #2).
+**Consequences:** every future config kind (the CDC/`scd2_apply` table, reconciliation
+configs) must route through the same `_load_yaml`/`_require_str_list` helpers rather than
+re-implementing ad hoc parsing, so these three invariants stay enforced repo-wide rather than
+per-loader.

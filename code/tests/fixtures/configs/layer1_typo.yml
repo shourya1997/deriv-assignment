@@ -1,0 +1,13 @@
+kind: table
+name: layer1_typo
+source:
+  format: csv
+  glob: "typo_*.csv"
+  natural_key: [id]
+  expected_columns: [id, value]
+layer1: {targett: raw.layer1_typo}
+layer2: {target: staging.layer1_typo, conflict_strategy: upsert_do_update}
+layer3:
+  - target: warehouse.fact_typo
+    strategy: fact_upsert
+orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [test]}

@@ -65,38 +65,59 @@ repo actually in" independent of git history.
 - Open issues carried into Step 2: `airflow-init` needs `python -m deriv_pipeline.config
   --validate-all` added back once `deriv_pipeline/config.py` exists.
 
-## Step 2 — config schema (IN PROGRESS — stopped at 90% usage safeguard)
+## Step 2 — config schema
 
-- Written so far (red, not yet green — `deriv_pipeline/config.py` does not exist yet):
-  `tests/unit/test_config.py` (6 tests: minimal table parse, unknown-strategy rejection,
-  missing-natural-key rejection, derived_dimension parse, generated_dimension parse,
-  reconciliation parse) and matching fixtures in `tests/fixtures/configs/`:
-  `minimal_table.yml`, `unknown_strategy.yml`, `missing_natural_key.yml`,
-  `derived_dimension.yml`, `generated_dimension.yml`, `reconciliation.yml`.
-- **Not yet done — next session starts here:**
-  1. Implement `deriv_pipeline/config.py`: `TableConfig` (kind/name/source/layer1/layer2/
-     layer3 dataclasses, `.load(path)` classmethod, `.load_all(kind=...)` classmethod scanning
-     `config/tables/*.yml`), `DerivedDimensionConfig`, `GeneratedDimensionConfig` (parses
-     `from`/`to` as dates), `ReconciliationConfig` (`.load_all()` scanning
-     `config/reconciliations/*.yml`). Validate `layer3[i].strategy` against the enum
-     `dimension_upsert | fact_upsert | scd2_apply | scd2_baseline_seed` (raise `ValueError`
-     mentioning "strategy" on an unknown value) and require `source.natural_key` to be present
-     and non-empty (raise `ValueError` mentioning "natural_key" if missing) — see the exact
-     fixture files and test assertions in `tests/unit/test_config.py` for the precise API shape
-     expected (attribute names: `cfg.kind`, `cfg.name`, `cfg.source.natural_key`,
-     `cfg.layer1.target`, `cfg.layer2.target`, `cfg.layer3[i].strategy`,
-     `DerivedDimensionConfig.source_table/source_column/target`,
-     `GeneratedDimensionConfig.target/from_date/to_date`,
-     `ReconciliationConfig.name/left/right`).
-  2. Run `pytest tests/unit/test_config.py -v` locally (venv) until all 6 pass.
-  3. Only then write the real `config/tables/vendor_deposits.yml` (per the plan's normative
-     schema example) plus a **separate** `test_all_shipped_configs_validate` test — not a
-     tautology reusing the same fixture-driven test.
-  4. Add `python -m deriv_pipeline.config --validate-all` back into `airflow-init`'s command in
-     `docker-compose.yml` (removed in Step 1 because the module didn't exist yet) as a
-     `__main__` block in `config.py` that calls `TableConfig.load_all()` /
-     `ReconciliationConfig.load_all()` for every kind and exits non-zero on any failure.
-  5. Dual review (Opus + Sonnet), apply fixes, then run the full per-phase ritual (append this
-     section properly, check off Step 2 in TASK.md, ADR entry if any new decision, commit,
-     update tracker artifact, compact context) before moving to Step 3.
-- No commit yet for this partial work — it is staged/on-disk only as of this snapshot.
+- Built `deriv_pipeline/config.py`: `TableConfig`/`DerivedDimensionConfig`/
+  `GeneratedDimensionConfig`/`ReconciliationConfig` dataclasses + `.load()`/`.load_all()`,
+  a single enumerate-and-dispatch pass over `config/tables/*.yml` (`_load_all_table_dir`),
+  `validate_all()`, and a `python -m deriv_pipeline.config --validate-all` CLI re-added to
+  `airflow-init`'s command in `docker-compose.yml` (removed in Step 1 since the module didn't
+  exist yet). First real config shipped: `config/tables/vendor_deposits.yml`.
+- Tests green: 42/42, locally (venv against a bare `docker compose up -d postgres`) and via
+  the containerized `docker compose --profile test run --rm tests` path. `docker compose up
+  -d --build` end-to-end: `airflow-init` prints `config validation OK: 1 config(s) —
+  vendor_deposits`, scheduler/webserver come up healthy.
+- Dual review (Opus + Sonnet) converged independently on the same 3 real bugs, plus Opus
+  found a 4th; all fixed:
+  - **Major (both reviewers, independently):** `source.natural_key` (and
+    `expected_columns`/`update_columns`/`layer3[].columns`) only checked truthiness, not
+    type — `natural_key: deposit_id` (missing YAML brackets) is a truthy non-empty string,
+    silently accepted, and would later be iterated character-by-character instead of as one
+    column name. Added `_require_str_list()`: rejects anything that isn't a YAML list of
+    strings, with the file path in the error.
+  - **Major (both reviewers, independently):** `LayerTarget(**raw["layer1"])` /
+    `Layer3Target(**entry)` unpacked raw YAML dicts straight into dataclass constructors —
+    a typo'd key (`conflict_stratgey`) or missing required key raised a bare `TypeError`/
+    `KeyError` with no file path, and the CLI's `except Exception: print(str(exc))` discarded
+    the traceback entirely, so `airflow-init`'s one-shot log gave no way to find the broken
+    file. Wrapped every dataclass construction to re-raise `ValueError(f"{path}: ...")`, and
+    the CLI now also prints the full traceback.
+  - **Major (Opus):** an unrecognized/typo'd `kind` (`kind: tabel`, or a `.yaml` extension)
+    was silently skipped by every one of the three per-kind `load_all()` filters — a broken
+    config file produced a green `--validate-all` and a silently-missing DAG, the worst
+    failure mode for a config-driven design. Replaced the three independent filter-and-load
+    passes with one `_load_all_table_dir()` that reads each file's `kind` once and raises on
+    anything outside `{table, derived_dimension, generated_dimension}` — this also fixed
+    Sonnet's separately-flagged double-YAML-parse inefficiency as a side effect.
+  - **Major (Opus):** `validate_all()` treated zero configs found (missing/misconfigured
+    `CONFIG_DIR`, wrong `DERIV_CONFIG_DIR`, empty directory) as success — `airflow-init` would
+    print `config validation OK: 0 config(s)` and exit 0. Now raises `ValueError` if
+    `config/tables/*.yml` is empty. Also fixed: a missing/misspelled `--validate-all` flag
+    used to fall through and exit 0 silently — now exits 2 with a usage message.
+  - **Minor (Opus):** `config.py` imported `REPO_ROOT` from `db.py`, which does `import
+    psycopg` at module scope — a pure-YAML validation pass needlessly depended on the DB
+    driver. `config.py` now computes `REPO_ROOT` itself.
+  - **Minor (Opus):** empty/comment-only YAML files raised an opaque `AttributeError`
+    (`None.get(...)`). `_load_yaml()` now raises a clear `ValueError` naming the path.
+  - **Minor (Opus):** `GeneratedDimensionConfig` didn't check `from_date <= to_date` — an
+    inverted range would silently produce an empty `dim_date`. Now raises.
+  - New tests added for all of the above:
+    `test_rejects_natural_key_as_scalar`, `test_layer_target_typo_raises_value_error_with_path`,
+    `test_rejects_unknown_kind_in_table_dir`, `test_validate_all_raises_on_empty_config_dir`,
+    `test_rejects_generated_dimension_from_after_to`.
+- Open issue noted, not yet fixed (Sonnet, minor, low priority): `config/reconciliations/`
+  is currently empty and untracked by git (git doesn't track empty dirs) — a fresh clone will
+  simply lack the directory until `vendor_feed.yml` lands in Step 9.
+  `ReconciliationConfig.load_all()` already treats a missing directory as "zero results", not
+  an error, so this is a documented gap rather than a bug — revisit if Step 9 needs an earlier
+  placeholder.
