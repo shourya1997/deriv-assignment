@@ -17,6 +17,7 @@ The full assignment brief is in [ASSIGNMENT.md](ASSIGNMENT.md).
 | [sql/](sql/) | DDL and functions referenced from Part 2: dimension/fact tables, the CDC apply function (SCD2 + tombstone logic), and the historical-reload/watermark-reset mechanism. |
 | [PROMPTS.md](PROMPTS.md) | Every AI-assisted design decision in this repo, grouped by part — the actual questions asked, what was recommended, what was decided, and where the AI's recommendation was corrected or overridden. |
 | [data/](data/) | The assignment's input files (four warehouse JSON tables, three vendor CSV extracts, one CDC JSONL stream) that every design decision in this repo is grounded in. |
+| [code/](code/) | Optional runnable prototype of Parts 1–2: dockerized Postgres + Airflow, one generated DAG per table config. Start with [code/README.md](code/README.md) for local run instructions, the config/DQ authoring guides, architecture diagrams, and a code-flow walkthrough. |
 
 ## Platform choices
 
