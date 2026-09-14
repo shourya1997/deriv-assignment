@@ -273,6 +273,22 @@ class TableConfig:
                                 f"{path}: fk_resolution[{fk_col!r}] missing required"
                                 f" key(s) {sorted(missing)}"
                             )
+                        if (
+                            rule.get("dim_target") == "warehouse.dim_instrument"
+                            and not raw.get("orchestration", {}).get("requires_dim_instrument")
+                        ):
+                            # Only bootstrap_warehouse (schedule=None) populates
+                            # dim_instrument — without this flag + dag_factory's
+                            # sensor, a fresh deploy's first @daily run races it
+                            # and can crash (Step 5 dual review finding). Missing
+                            # the symmetric check scd2_apply already has for
+                            # requires_scd2_baseline (Step 9 dual review finding,
+                            # Opus).
+                            raise ValueError(
+                                f"{path}: fk_resolution[{fk_col!r}] targets"
+                                f" warehouse.dim_instrument, which requires"
+                                f" orchestration.requires_dim_instrument: true"
+                            )
                     elif rule not in _FACT_UPSERT_FK_SENTINELS:
                         # A typo'd sentinel (e.g. "inferred_member" instead of
                         # "inferred_member_on_miss") silently flips behavior

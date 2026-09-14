@@ -6,6 +6,8 @@ import pytest
 airflow = pytest.importorskip("airflow")
 from airflow.models import DagBag  # noqa: E402
 
+from deriv_pipeline.config import ReconciliationConfig, TableConfig  # noqa: E402
+
 
 @pytest.fixture(scope="module")
 def dagbag():
@@ -14,6 +16,57 @@ def dagbag():
 
 def test_no_dag_import_errors(dagbag):
     assert dagbag.import_errors == {}
+
+
+def test_dag_factory_generates_one_dag_per_table_config(dagbag):
+    """Step 10 completeness guardrail: every `kind: table` config must have
+    produced exactly one `table__{name}` DAG — not just the handful spot-
+    checked by name in the tests below — and nothing else. Guards against a
+    config silently failing to generate a DAG (e.g. an exception swallowed by
+    a future refactor of the factory's loop)."""
+    table_cfgs = TableConfig.load_all(kind="table")
+    expected = {f"table__{cfg.name}" for cfg in table_cfgs}
+    # A set alone can't distinguish "6 configs, 6 DAGs" from "a missing/empty
+    # tables dir" or "two configs sharing a name collided in the factory's
+    # globals() registration" — both would still satisfy generated == expected
+    # as bare sets. Pin the count against the raw config list too.
+    assert len(table_cfgs) == len(expected) > 0
+    generated = {dag_id for dag_id in dagbag.dag_ids if dag_id.startswith("table__")}
+    assert generated == expected
+
+
+def test_dag_factory_generates_one_dag_per_reconciliation_config(dagbag):
+    recon_cfgs = ReconciliationConfig.load_all()
+    expected = {f"reconcile_{cfg.name}" for cfg in recon_cfgs}
+    assert len(recon_cfgs) == len(expected) > 0
+    generated = {dag_id for dag_id in dagbag.dag_ids if dag_id.startswith("reconcile_")}
+    assert generated == expected
+
+
+def test_generated_task_dependencies_are_layer1_2_3_order(dagbag):
+    """Every generated table__* DAG must run land_layer1 >> stage_layer2 >>
+    run_dq_checks >> load_layer3 in that order, regardless of whether it also
+    has a leading sensor — the four-task shape and its ordering is the one
+    thing every generated DAG must never diverge on (ADR-1)."""
+    table_cfgs = TableConfig.load_all(kind="table")
+    assert table_cfgs  # a zero-iteration loop below would vacuously "pass"
+    for cfg in table_cfgs:
+        dag = dagbag.get_dag(f"table__{cfg.name}")
+        assert dag is not None, f"table__{cfg.name} was not generated"
+        land = dag.get_task("land_layer1")
+        stage = dag.get_task("stage_layer2")
+        dq = dag.get_task("run_dq_checks")
+        load = dag.get_task("load_layer3")
+        assert set(land.downstream_task_ids) == {"stage_layer2"}
+        assert set(stage.downstream_task_ids) == {"run_dq_checks"}
+        assert set(dq.downstream_task_ids) == {"load_layer3"}
+        assert set(load.downstream_task_ids) == set()
+        # Any extra task (a sensor) must actually be wired upstream of
+        # land_layer1, not just constructed and left dangling — a config
+        # whose orchestration flag is set but whose sensor >> land_layer1
+        # edge got dropped in a refactor would otherwise still pass.
+        extra_tasks = set(dag.task_ids) - {"land_layer1", "stage_layer2", "run_dq_checks", "load_layer3"}
+        assert set(land.upstream_task_ids) == extra_tasks
 
 
 def test_vendor_deposits_dag_exists_with_expected_task_shape(dagbag):

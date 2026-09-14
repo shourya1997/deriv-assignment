@@ -13,7 +13,7 @@ Full spec: `/Users/shouryasengupta/.claude/plans/compiled-wobbling-quilt.md`.
 - [x] Step 7 — historical reload (cdc_historical_reload DAG)
 - [x] Step 8 — Great Expectations (one real suite) + SQL-assertion DQ for the rest
 - [x] Step 9 — reconciliation (vendor_feed)
-- [ ] Step 10 — DAG factory completeness + auto-generation guardrail tests
+- [x] Step 10 — DAG factory completeness + auto-generation guardrail tests
 - [ ] Step 11 — docs (code/README.md, root README.md status, CLAUDE.md note)
 
 Per-phase ritual (every step above): update tracker artifact "in progress" → implement TDD →

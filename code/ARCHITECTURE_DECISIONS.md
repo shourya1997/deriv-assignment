@@ -694,3 +694,70 @@ on a same-`run_id` re-run for *table* DQ checks too (Sonnet) — but `dq.log_che
 unchanged Step 8 code, already exercised by every `table__*` DAG's existing run-twice block in
 `verify.sh` before this phase; not a regression Step 9 introduced, and out of this phase's scope
 to fix retroactively.
+
+## ADR-14 — Step 10: DAG factory completeness guardrails, and closing the requires_dim_instrument gap
+
+**Decision:** add the two guardrail tests the plan names that didn't already exist
+(`test_dag_factory_generates_one_dag_per_table_config`, `test_generated_task_dependencies_are_
+layer1_2_3_order`), generic across every shipped `kind: table` config rather than the handful of
+per-table tests already spot-checking specific DAGs by name; the other two named checks
+(`DagBag` zero import errors, `dags/` holding only the factory + hand-authored files) already
+existed from earlier phases. Also close a real config-validation gap this review surfaced:
+`requires_dim_instrument` had no load-time enforcement, unlike its `scd2_apply` sibling.
+
+**Why this step found no factory bug:** `dag_factory.py` was assembled incrementally across
+Steps 3-9, each phase adding one config-driven loop iteration or one new orchestration flag under
+its own dual review. Step 10's job was to write the *generic* completeness check that step-by-step
+development never needed — nothing here is a rewrite, and the review confirms it: no bug found in
+`dag_factory.py` itself (closures capture the right `cfg`, `_run`'s commit/rollback/close contract
+is correct, `run_id` reaches `dq`/`recon` via `**context`), only test-side gaps and one
+config-validation gap.
+
+**The two vacuous-pass gaps found in the new tests, both from the same root cause:** a test
+comparing two sets built from the *same* source data (`generated == expected` where `expected`
+comes from `load_all()`) proves the factory looped over whatever `load_all` returned, not that
+what it returned is actually right — an empty/misconfigured config dir would make both sides
+`set()` and pass; a zero-config loop body silently "passes" a check that never ran. Both fixed by
+pinning `len(cfgs) > 0` (and, as a byproduct, `len(cfgs) == len(expected_dag_ids)` — see next
+finding). A pattern worth remembering for any future generic-config-loop test in this codebase:
+deriving both sides of an equality from the same `load_all()` call needs an independent
+non-emptiness/cardinality check alongside it, or the test can pass for reasons that have nothing
+to do with correctness.
+
+**The duplicate-name collision gap:** `dag_factory.py`'s `globals()[f"table__{cfg.name}"] = ...`
+loop has no protection against two config files sharing a `name:` — the second would silently
+overwrite the first's DAG registration, and the original set-based test couldn't see this because
+the expected-set comprehension collapses the duplicate name into one string too. `validate_all()`
+already guards against this class of collision for cross-directory names (Step 9's ADR-13 added
+the table-vs-reconciliation half); this phase's fix is narrower and test-side only — comparing
+`len(TableConfig.load_all(kind="table"))` against `len(expected_dag_ids)` — since a same-directory
+`kind: table` name collision was already out of scope for ADR-13's fix and this is the cheapest
+place to catch it.
+
+**Closing the `requires_dim_instrument` gap:** Step 6 (ADR-10) made `orchestration.
+requires_scd2_baseline: true` mandatory whenever `layer3.strategy: scd2_apply` appears, explicitly
+because a missing/typo'd flag would silently drop the cross-DAG sensor and reintroduce the exact
+race Step 5 (ADR-9) fixed. The identical hazard exists for `requires_dim_instrument` — any future
+`fact_upsert` config whose `fk_resolution` targets `warehouse.dim_instrument` needs the same flag
++ sensor, and nothing enforced it. This went unnoticed for 4 phases (Steps 6-9) because only one
+shipped config (`client_trades.yml`) has ever exercised this path, and it happens to have the flag
+set correctly. Fixed with the symmetric check: `TableConfig.load()` now raises if any
+`fact_upsert` `fk_resolution` dict rule has `dim_target: warehouse.dim_instrument` without
+`orchestration.requires_dim_instrument: true`. This is exactly the kind of gap a completeness step
+is supposed to surface — a correctness invariant established once (Step 6) that was never
+generalized to its sibling case (Step 5's own flag), caught only by reviewing the two side by side.
+
+**Dual review findings, all applied:**
+- Vacuous-pass risk in both new dag-count tests (Opus) — fixed, `assert len(cfgs) == len(expected)
+  > 0`.
+- Set comparison can't catch a duplicate config name (Sonnet) — fixed by the same length check.
+- Vacuous-pass risk in the new ordering test on an empty config list (Opus) — fixed,
+  `assert table_cfgs` before the loop.
+- Sensor wiring only checked downstream of `land_layer1`, not that a leading sensor is actually
+  connected (Opus) — fixed, the ordering test now also asserts `land_layer1`'s upstream set equals
+  exactly the DAG's non-core tasks.
+- Missing `requires_dim_instrument` config-load-time enforcement (Opus) — fixed as described above.
+
+**Not changed:** pre-existing tests' `list(x.downstream_task_ids) == [...]` pattern relies on a
+set happening to iterate as a one-element list (Opus, minor) — harmless today, not worth churning
+already-passing tests; new tests use `set(...) == {...}` instead so this doesn't propagate further.

@@ -676,3 +676,52 @@ full detail:
   checks (Sonnet, noted as pre-existing) — `dq.log_check` itself is unchanged, insert-only Step 8
   code already exercised by every `table__*` DAG's existing run-twice block in `verify.sh`; not a
   regression introduced by Step 9, out of this phase's scope.
+
+## Step 10 — DAG factory completeness + auto-generation guardrail tests
+
+- Scope per the plan: the four named checks. Two already existed from earlier phases
+  (`test_no_dag_import_errors`, `test_dags_dir_contains_only_factory_and_named_hand_authored_files`)
+  — this phase's real work was the two that didn't:
+  `test_dag_factory_generates_one_dag_per_table_config` (+ a reconciliation-config counterpart, not
+  named in the plan but the same class of gap after Step 9 added a second `load_all()`-driven DAG
+  loop) and `test_generated_task_dependencies_are_layer1_2_3_order`, generic across every shipped
+  `kind: table` config rather than the handful spot-checked by name in pre-existing tests.
+- This was meant to be a thin verification pass over already-correct code (built incrementally
+  across Steps 3-9), not a rewrite — and that held: no `dag_factory.py` bug was found, only test
+  gaps and one real config-validation gap (below).
+- Full suite: 116/116 passing. `scripts/verify.sh`: PASS end-to-end.
+
+**Dual review (Opus + Sonnet)**, both directly against the repo (no `isolation: worktree`, per
+ADR-9's lesson). **All confirmed findings fixed:**
+  - **Vacuous-pass risk in the new dag-count tests (Opus)** — `generated == expected` where both
+    sides derive from the same `load_all()` call proves "the factory looped over whatever
+    `load_all` returned," not "the expected tables exist"; a broken/empty config dir would make
+    both sides `set()` and pass. Fixed: added `assert len(cfgs) == len(expected) > 0` pinning both
+    a non-empty count and (see next finding) no name collision.
+  - **Set comparison can't catch a duplicate config `name:` (Sonnet)** — two `kind: table` YAML
+    files sharing a `name:` would have the second silently overwrite the first in
+    `dag_factory.py`'s `globals()[f"table__{cfg.name}"] = ...` (one DAG lost, no error), but the
+    expected-set comprehension collapses the duplicate into one string too, so `generated ==
+    expected` would still hold. Fixed by the same `len(cfgs) == len(expected)` check above — a
+    duplicate name makes the two lengths diverge.
+  - **Vacuous-pass risk in the new ordering test (Opus)** — a zero-config `TableConfig.load_all()`
+    would make the `for` loop body never execute, "passing" a broken factory. Fixed: added
+    `assert table_cfgs` before the loop.
+  - **Sensor wiring only checked downstream of `land_layer1`, not that a leading sensor is
+    actually connected to it (Opus)** — a config whose sensor is constructed but whose `sensor >>
+    land_layer1` edge got dropped in a refactor would leave a dangling root task and still pass;
+    only the two named per-table tests pin this, not the generic loop. Fixed: the ordering test
+    now also asserts `land_layer1`'s upstream task set equals exactly the DAG's non-core tasks
+    (i.e. any sensor present, and nothing unexpected).
+  - **`requires_dim_instrument` has no config-load-time enforcement, unlike its `scd2_apply`/
+    `requires_scd2_baseline` sibling (Opus)** — `config.py` already makes
+    `requires_scd2_baseline: true` mandatory whenever `layer3.strategy: scd2_apply` is declared
+    (Step 6), precisely because a missing/typo'd flag silently drops the sensor and reintroduces
+    the Step 5 cross-DAG race — but the identical hazard for `fk_resolution` rules targeting
+    `warehouse.dim_instrument` was unguarded. Fixed: `TableConfig.load()` now raises if any
+    `fact_upsert` `fk_resolution` dict rule has `dim_target: warehouse.dim_instrument` without
+    `orchestration.requires_dim_instrument: true` — the exact symmetric check.
+- **Minor, noted not changed**: pre-existing tests' `list(x.downstream_task_ids) == [...]` pattern
+  relies on `downstream_task_ids` (a set) happening to iterate as a single-element list — harmless
+  while there's exactly one downstream task, not worth churning the already-passing tests that use
+  it (Opus, minor). New tests use `set(...) == {...}` instead.
