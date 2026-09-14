@@ -34,6 +34,7 @@ original brief.
 - Keep `part1_pipeline.md` / `part2_data_model.md` / `part3_architecture.md` self-contained:
   inline the SQL and explanation together. Code without accompanying explanation doesn't
   score per the assignment's own constraints.
-- `code/` prototype is optional and currently **not started** — see README.md Status. If
-  building it, it should exercise the actual `sql/` schema against `data/`, not reimplement
-  the logic separately.
+- `code/` prototype is optional and **done** — see README.md Status and `code/README.md`. It
+  exercises the actual `sql/` schema against `data/` via Airflow DAGs, not a reimplementation;
+  its own `code/TASK.md`/`code/PROGRESS.md`/`code/ARCHITECTURE_DECISIONS.md` are the source of
+  truth for its build history — read those before making further `code/` changes.

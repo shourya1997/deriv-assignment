@@ -34,6 +34,10 @@ downstream decision.
 - `README.md`, `PROMPTS.md`, `part1_pipeline.md`, `part2_data_model.md`,
   `part3_architecture.md`, and `sql/` — **done**, satisfy every MUST COMPLETE and VALIDATION
   requirement in [ASSIGNMENT.md](ASSIGNMENT.md).
-- `code/` (optional runnable prototype) — **not started yet**, deferred by design. When
-  built, it should load `data/` into a local Postgres and exercise the idempotency,
-  watermark, and SCD2 logic from `sql/` for real, not just as documentation.
+- [code/](code/) (optional runnable prototype) — **done**. A config-driven, dockerized,
+  TDD-built implementation: Postgres + Airflow, one generated DAG per table config, real
+  data loaded from [data/](data/) exercising the idempotency, watermark, and SCD2 logic from
+  `sql/` end-to-end. `cd code && docker compose up -d --build && make verify`. See
+  [code/README.md](code/README.md) for architecture and documented trade-offs, and
+  [code/PROGRESS.md](code/PROGRESS.md) / [code/ARCHITECTURE_DECISIONS.md](code/ARCHITECTURE_DECISIONS.md)
+  for the full build log.

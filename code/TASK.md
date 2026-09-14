@@ -14,7 +14,9 @@ Full spec: `/Users/shouryasengupta/.claude/plans/compiled-wobbling-quilt.md`.
 - [x] Step 8 — Great Expectations (one real suite) + SQL-assertion DQ for the rest
 - [x] Step 9 — reconciliation (vendor_feed)
 - [x] Step 10 — DAG factory completeness + auto-generation guardrail tests
-- [ ] Step 11 — docs (code/README.md, root README.md status, CLAUDE.md note)
+- [x] Step 11 — docs (code/README.md, root README.md status, CLAUDE.md note)
+
+All 12 phases complete. See PROGRESS.md/ARCHITECTURE_DECISIONS.md for the full build log.
 
 Per-phase ritual (every step above): update tracker artifact "in progress" → implement TDD →
 dual review (Opus + Sonnet) → apply confirmed findings → update PROGRESS.md/TASK.md/

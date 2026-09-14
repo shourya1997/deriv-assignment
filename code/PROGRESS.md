@@ -725,3 +725,22 @@ ADR-9's lesson). **All confirmed findings fixed:**
   relies on `downstream_task_ids` (a set) happening to iterate as a single-element list — harmless
   while there's exactly one downstream task, not worth churning the already-passing tests that use
   it (Opus, minor). New tests use `set(...) == {...}` instead.
+
+## Step 11 — docs
+
+Pure documentation, no TDD/dual-review cycle (nothing to make green, no diff to dual-review) —
+judged against the plan's own Step 11 wording, which lists only three doc deliverables and no
+tests.
+
+- **`code/README.md`** (new) — architecture summary (config-driven layer engine, `dag_factory.py`,
+  DQ, reconciliation), run instructions (`docker compose up -d --build && make verify`), the four
+  documented trade-offs from the plan's Caveats section (watermark-drop-until-reload stated
+  explicitly, as required; CRITICAL-doesn't-block-load; `resolve_risk_snapshot_key()`'s missing
+  `ORDER BY`; tombstone `is_current` semantics), and a test-running section.
+- **Root `README.md`** — Status section flipped `code/` from "not started yet" to "done", pointing
+  at `code/README.md` and the `code/` tracking files instead of restating their content.
+- **Root `CLAUDE.md`** — the `code/` note updated from "optional and currently not started" to
+  "optional and done", pointing future sessions at `code/TASK.md`/`PROGRESS.md`/
+  `ARCHITECTURE_DECISIONS.md` as the source of truth before making further `code/` changes.
+
+All 12 phases (Step 0–11) of the plan are now complete.

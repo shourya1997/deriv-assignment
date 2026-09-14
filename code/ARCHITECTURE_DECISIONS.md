@@ -761,3 +761,11 @@ generalized to its sibling case (Step 5's own flag), caught only by reviewing th
 **Not changed:** pre-existing tests' `list(x.downstream_task_ids) == [...]` pattern relies on a
 set happening to iterate as a one-element list (Opus, minor) — harmless today, not worth churning
 already-passing tests; new tests use `set(...) == {...}` instead so this doesn't propagate further.
+
+## Step 11 — docs, no new ADR
+
+Pure documentation (`code/README.md`, root `README.md` Status, root `CLAUDE.md`); no code changed,
+so no architecture decision to record here. See [PROGRESS.md](PROGRESS.md)'s Step 11 entry for
+what was written and why the usual TDD/dual-review cycle didn't apply to a docs-only phase.
+
+All 12 phases (Step 0–11) of the plan are now complete.
