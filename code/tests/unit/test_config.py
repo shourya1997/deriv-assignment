@@ -32,6 +32,45 @@ def test_rejects_missing_natural_key():
         TableConfig.load(FIXTURES / "missing_natural_key.yml")
 
 
+def test_parses_layer2_dq_checks():
+    from deriv_pipeline.config import TableConfig
+
+    cfg = TableConfig.load(FIXTURES / "dq_checks.yml")
+    assert len(cfg.layer2.dq_checks) == 1
+    check = cfg.layer2.dq_checks[0]
+    assert check.name == "value_positive"
+    assert check.severity == "CRITICAL"
+    assert "staging.minimal_table" in check.sql
+
+
+def test_rejects_dq_check_with_unknown_severity():
+    from deriv_pipeline.config import TableConfig
+
+    with pytest.raises(ValueError, match="severity"):
+        TableConfig.load(FIXTURES / "dq_checks_bad_severity.yml")
+
+
+def test_rejects_dq_checks_that_is_not_a_list():
+    from deriv_pipeline.config import TableConfig
+
+    with pytest.raises(ValueError, match="dq_checks must be a YAML list"):
+        TableConfig.load(FIXTURES / "dq_checks_not_a_list.yml")
+
+
+def test_rejects_dq_checks_declared_under_layer1():
+    from deriv_pipeline.config import TableConfig
+
+    with pytest.raises(ValueError, match="dq_checks is only read from layer2"):
+        TableConfig.load(FIXTURES / "dq_checks_under_layer1.yml")
+
+
+def test_rejects_duplicate_dq_check_names():
+    from deriv_pipeline.config import TableConfig
+
+    with pytest.raises(ValueError, match="duplicate dq_checks name"):
+        TableConfig.load(FIXTURES / "dq_checks_duplicate_name.yml")
+
+
 def test_parses_derived_dimension_config():
     from deriv_pipeline.config import DerivedDimensionConfig
 

@@ -6,7 +6,12 @@ source:
   natural_key: [client_id, lsn]
   expected_columns: [client_id, lsn, commit_ts, op, before, after]
 layer1: {target: raw.client_profile_changes}
-layer2: {target: staging.client_profile_changes}
+layer2:
+  target: staging.client_profile_changes
+  dq_checks:
+    - name: op_is_known
+      sql: "SELECT count(*) FROM staging.client_profile_changes WHERE op NOT IN ('insert', 'update', 'delete')"
+      severity: CRITICAL
 layer3:
   - target: warehouse.dim_client_risk_snapshot
     strategy: scd2_apply

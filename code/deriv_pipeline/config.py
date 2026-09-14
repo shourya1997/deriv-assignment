@@ -31,6 +31,7 @@ CONFIG_DIR = Path(os.environ.get("DERIV_CONFIG_DIR") or (REPO_ROOT / "code" / "c
 
 LAYER3_STRATEGIES = {"dimension_upsert", "fact_upsert", "scd2_apply", "scd2_baseline_seed"}
 TABLE_CONFIG_KINDS = {"table", "derived_dimension", "generated_dimension"}
+DQ_SEVERITIES = {"INFO", "WARNING", "CRITICAL"}
 
 # fact_upsert's fk_resolution[col] is either one of these two special
 # strings, or a dict (validated below) shaped like dimension_upsert's
@@ -76,11 +77,26 @@ class SourceConfig:
 
 
 @dataclass
+class DqCheck:
+    """One config-declared SQL assertion (Step 8): `sql` must return a single
+    row/column giving the number of rows that fail the check. Routed through
+    the same severity levels as quarantine.rejected_rows (INFO/WARNING/
+    CRITICAL) — a CRITICAL failure also quarantines a summary row; anything
+    else is just logged to data_quality.dq_check_results for
+    dq_table_health's regression tracking."""
+
+    name: str
+    sql: str
+    severity: str
+
+
+@dataclass
 class LayerTarget:
     target: str
     conflict_strategy: str | None = None
     update_columns: list[str] = field(default_factory=list)
     ge_suite: str | None = None
+    dq_checks: list[DqCheck] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +118,38 @@ class Layer3Target:
     literals: dict[str, str] = field(default_factory=dict)
 
 
+def _build_dq_checks(raw: dict, path: Path, label: str) -> list[DqCheck]:
+    """`dq.py` (Step 8) only ever reads `cfg.layer2.dq_checks` — a `dq_checks`
+    block anywhere else would parse fine but silently run zero checks, so
+    it's rejected here rather than left as a footgun."""
+    raw_checks = raw.get("dq_checks")
+    if raw_checks is None:
+        return []
+    if label != "layer2":
+        raise ValueError(f"{path}: dq_checks is only read from layer2, found under {label}")
+    if not isinstance(raw_checks, list):
+        raise ValueError(f"{path}: dq_checks must be a YAML list, got {raw_checks!r}")
+
+    checks = []
+    seen_names = set()
+    for entry in raw_checks:
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path}: dq_checks entry must be a YAML mapping, got {entry!r}")
+        severity = entry.get("severity")
+        if severity not in DQ_SEVERITIES:
+            raise ValueError(
+                f"{path}: dq_checks severity {severity!r} must be one of {sorted(DQ_SEVERITIES)}"
+            )
+        name, sql = entry.get("name"), entry.get("sql")
+        if not isinstance(name, str) or not isinstance(sql, str):
+            raise ValueError(f"{path}: dq_checks entry requires string name and sql: {entry!r}")
+        if name in seen_names:
+            raise ValueError(f"{path}: duplicate dq_checks name {name!r}")
+        seen_names.add(name)
+        checks.append(DqCheck(name=name, sql=sql, severity=severity))
+    return checks
+
+
 def _build_layer_target(raw: dict, path: Path, label: str) -> LayerTarget:
     try:
         update_columns = _require_str_list(raw, "update_columns", path, required=False)
@@ -110,6 +158,7 @@ def _build_layer_target(raw: dict, path: Path, label: str) -> LayerTarget:
             conflict_strategy=raw.get("conflict_strategy"),
             update_columns=update_columns,
             ge_suite=raw.get("ge_suite"),
+            dq_checks=_build_dq_checks(raw, path, label),
         )
     except (TypeError, KeyError) as exc:
         raise ValueError(f"{path}: invalid {label} block: {exc}") from exc

@@ -1,0 +1,19 @@
+kind: table
+name: dq_checks_under_layer1
+source:
+  format: csv
+  glob: "minimal_*.csv"
+  natural_key: [minimal_id]
+  expected_columns: [minimal_id, value]
+layer1:
+  target: raw.minimal_table
+  dq_checks:
+    - name: value_positive
+      sql: "SELECT count(*) FROM staging.minimal_table WHERE value <= 0"
+      severity: CRITICAL
+layer2: {target: staging.minimal_table, conflict_strategy: upsert_do_update}
+layer3:
+  - target: warehouse.fact_minimal
+    strategy: fact_upsert
+    event_date_column: value
+orchestration: {schedule: "@daily", start_date: "2024-01-01", catchup: false, tags: [test]}

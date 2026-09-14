@@ -3,8 +3,9 @@
 Airflow's standard dynamic-DAG pattern (loop at module scope, register into
 `globals()`). Every generated DAG has the identical
 `land_layer1 >> stage_layer2 >> run_dq_checks >> load_layer3` shape — no
-per-table divergence lives here. `run_dq_checks` is a no-op placeholder until
-Step 8 wires real checks in; the shape doesn't change when it does.
+per-table divergence lives here. `run_dq_checks` dispatches to
+`deriv_pipeline.dq.run_dq_checks` (Step 8): the one real GE suite for
+vendor_deposits, config-declared SQL assertions for every other table.
 
 Two DAGs stay hand-authored (bootstrap_warehouse, cdc_historical_reload) for
 reasons documented in ARCHITECTURE_DECISIONS.md ADR-1 — this file never
@@ -17,6 +18,7 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
 
+from deriv_pipeline import dq
 from deriv_pipeline.config import TableConfig
 from deriv_pipeline.db import get_connection
 from deriv_pipeline.layers import layer1_raw, layer2_staging, layer3_warehouse
@@ -34,8 +36,11 @@ def _run(fn, cfg):
         conn.close()
 
 
-def _noop_dq_checks(cfg):
-    """Placeholder until Step 8 (Great Expectations + SQL-assertion DQ)."""
+def _run_dq_checks(cfg, **context):
+    # context["run_id"] is Airflow's own per-DAG-run id — shared by every
+    # task in this run with no extra XCom plumbing, which is exactly the
+    # shared `run_id` dq_table_health's regression comparison needs.
+    _run(lambda c, conn: dq.run_dq_checks(c, conn, context["run_id"]), cfg)
 
 
 def _dim_instrument_populated() -> bool:
@@ -119,7 +124,7 @@ def _make_dag(cfg: TableConfig) -> DAG:
             task_id="stage_layer2", python_callable=lambda: _run(layer2_staging.stage, cfg)
         )
         run_dq_checks = PythonOperator(
-            task_id="run_dq_checks", python_callable=lambda: _noop_dq_checks(cfg)
+            task_id="run_dq_checks", python_callable=_run_dq_checks, op_kwargs={"cfg": cfg}
         )
         load_layer3 = PythonOperator(
             task_id="load_layer3", python_callable=lambda: _run(layer3_warehouse.load, cfg)

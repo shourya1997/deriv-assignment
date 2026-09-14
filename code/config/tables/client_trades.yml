@@ -11,6 +11,10 @@ layer2:
   target: staging.client_trades
   conflict_strategy: upsert_do_update
   update_columns: [trade_status, pnl_usd]
+  dq_checks:
+    - name: volume_lots_positive
+      sql: "SELECT count(*) FROM staging.client_trades WHERE volume_lots IS NULL OR volume_lots <= 0"
+      severity: CRITICAL
 layer3:
   - target: warehouse.fact_trades
     strategy: fact_upsert

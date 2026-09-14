@@ -13,6 +13,10 @@ layer2:
   conflict_strategy: upsert_do_update
   update_columns: [signup_date, country, email, referral_source, account_type,
                     kyc_status, signup_platform, promo_code, assigned_manager]
+  dq_checks:
+    - name: email_not_null
+      sql: "SELECT count(*) FROM staging.client_signup WHERE email IS NULL"
+      severity: WARNING
 layer3:
   - target: warehouse.dim_client
     strategy: dimension_upsert

@@ -543,3 +543,69 @@ fact table FK'd into dimension X" should use `fk_columns_into()` rather than re-
 `pg_constraint` walk a third time. The date-at-midnight resolution precision limit (multiple
 same-day snapshot versions can be ambiguous for a fact dated only to the day) is now used in two
 call sites, not one — worth revisiting if a future source needs finer-grained event timestamps.
+
+## ADR-12 — Step 8: one real GE suite + SQL-assertion DQ, and why a CRITICAL failure doesn't block load
+
+**Decision:** `deriv_pipeline.dq.run_dq_checks(cfg, conn, run_id)` runs `run_ge_suite` for
+vendor_deposits only (the one real Great Expectations suite, per ADR-4/ADR-5's GE-version-coupling
+risk — a GE 0.18.22 ephemeral `SqlAlchemyExecutionEngine` DataContext, its exact API confirmed with
+a live smoke test inside the `airflow-scheduler` container rather than assumed from GE's docs) and
+`run_sql_assertions` for every other table (config-declared SQL in `layer2.dq_checks`, each
+returning a failing-row count). Both paths funnel through the identical `_record_result`: log one
+`data_quality.dq_check_results` row per check, and on a failed CRITICAL check, one summary row into
+`quarantine.rejected_rows`. `data_quality.dq_check_results` and the `dq_table_health` regression
+VIEW already existed from an earlier gap-fill migration (`008_data_quality.sql`) — this phase
+populates the log, it doesn't build the view.
+
+**The central decision: a failed CRITICAL check does not raise, fail the Airflow task, or block
+`load_layer3`.** This was not the first design tried.
+
+`part1_pipeline.md`'s own example ("a negative-amount deposit... not loaded into fact_deposits")
+describes per-row exclusion, and Opus's dual-review of an earlier draft flagged the initial
+log-only design as a must-fix, on the reasoning that a DQ check with no enforcement is decorative.
+I applied that fix — `run_dq_checks` committed its own writes then raised `ValueError` on any
+failed CRITICAL check — updated the corresponding test to `pytest.raises(...)`, and confirmed the
+full suite still passed.
+
+Then, working through the consequences for `scripts/verify.sh` (which runs `airflow dags test
+table__vendor_deposits ...` under `set -euo pipefail`), I found the real shipped `vendor_deposits`
+data contains a **permanent** negative-amount row (`VDEP001`/`CL003`/`-250.00` in
+`data/vendor_deposits.json`) — not a transient data-quality incident, a fixture of the demo data
+that will never go away. Raising on any CRITICAL failure means `run_dq_checks` fails *every single
+run* of that DAG, forever. Under `set -e`, one non-zero `airflow dags test` invocation aborts the
+rest of `verify.sh` — meaning this fix would permanently break the "make verify green" gate every
+other phase in this project depends on, the moment it's applied to real data rather than a
+synthetic test fixture.
+
+True per-row exclusion (what the design doc actually describes) would avoid this by only dropping
+the *offending row*, not failing the whole table — but building it means threading GE's
+`unexpected_index_list` / the failing natural key(s) out of `run_ge_suite`, through
+`run_dq_checks`, and into `layer3_warehouse.py`'s `fact_upsert` load query as an exclusion filter.
+That's real, non-trivial work (a new data contract between `dq.py` and `layer3_warehouse.py` that
+doesn't exist today) and out of Step 8's stated scope (one suite, wired dispatch — not a load-path
+redesign).
+
+**Reverted to:** log + quarantine every CRITICAL failure (the audit trail and quarantine row still
+exist — nothing is silently swallowed), but `run_dq_checks` never raises, so `load_layer3` always
+runs. Documented as an explicit corner-cut in `dq.py`'s module docstring:
+```
+# ponytail: table-level block/skip only, not per-row exclusion from
+# fact_upsert; upgrade path is teaching run_dq_checks to return failing
+# natural keys and layer3_warehouse to filter them out of its load query.
+```
+The corresponding test (`test_run_dq_checks_runs_the_one_real_ge_suite_and_quarantines_critical_
+failures`) asserts the failure is logged and quarantined, not that it raises.
+
+**Why this belongs in an ADR and not just a code comment:** it's a direct, deliberate departure
+from the literal wording of `part1_pipeline.md`'s own worked example, made by weighing that
+example's intent (real DQ enforcement) against a hard, empirically-verified constraint (the
+project's own permanent verify-green requirement) rather than by scope-cutting reflexively. A
+future reader extending `dq.py` needs to know *why* it doesn't raise before "fixing" it back to
+raising and reintroducing the same permanent `verify.sh` breakage.
+
+**Consequences:** every other table's `dq_checks` — checked against real shipped data for all 4
+non-vendor_deposits tables before this decision was finalized — currently has zero CRITICAL
+failures, so this corner-cut is latent everywhere except vendor_deposits today. The upgrade path
+(per-row exclusion) is real future work if this prototype's DQ story needs to move from "detect and
+audit" to "detect and prevent bad rows reaching the warehouse," and would need `layer3_warehouse.py`
+changes, not just `dq.py` changes.

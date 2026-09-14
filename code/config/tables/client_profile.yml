@@ -14,6 +14,10 @@ layer2:
   update_columns: [full_name, date_of_birth, nationality, risk_category,
                     account_balance_usd, account_status, currency,
                     last_login_date, preferred_language]
+  dq_checks:
+    - name: account_balance_not_negative
+      sql: "SELECT count(*) FROM staging.client_profile WHERE account_balance_usd IS NULL OR account_balance_usd < 0"
+      severity: CRITICAL
 layer3:
   - target: warehouse.dim_client
     strategy: dimension_upsert

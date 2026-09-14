@@ -12,6 +12,10 @@ layer2:
   target: staging.client_deposit
   conflict_strategy: upsert_do_update
   update_columns: [status, fee_usd]
+  dq_checks:
+    - name: amount_usd_positive
+      sql: "SELECT count(*) FROM staging.client_deposit WHERE amount_usd IS NULL OR amount_usd <= 0"
+      severity: CRITICAL
 layer3:
   - target: warehouse.fact_deposits
     strategy: fact_upsert
