@@ -41,6 +41,12 @@ for dag_id in $dag_ids; do
     docker compose run --rm --no-deps airflow-scheduler airflow dags test "$dag_id" 2024-03-01
 done
 
+echo "-- reconcile_vendor_feed (run 1) -- must run after the table__* DAGs above so both"
+echo "   fact_deposits sources (vendor + internal) are populated (Step 9)"
+docker compose run --rm --no-deps airflow-scheduler airflow dags test reconcile_vendor_feed 2024-03-01
+echo "-- reconcile_vendor_feed (run 2, idempotency) --"
+docker compose run --rm --no-deps airflow-scheduler airflow dags test reconcile_vendor_feed 2024-03-01
+
 echo "-- cdc_historical_reload (run 1) -- manual, hand-authored (Step 7); must run after"
 echo "   table__client_profile_changes above so there is real CDC history to reset+replay"
 docker compose run --rm --no-deps airflow-scheduler airflow dags test cdc_historical_reload 2024-03-01

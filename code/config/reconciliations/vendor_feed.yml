@@ -1,0 +1,10 @@
+name: vendor_feed
+key: [client_id, deposit_date, amount_usd]
+left: >
+  SELECT c.client_id, f.deposit_date, f.amount_usd
+  FROM warehouse.fact_deposits f JOIN warehouse.dim_client c USING (client_key)
+  WHERE f.source_system = 'vendor'
+right: >
+  SELECT c.client_id, f.deposit_date, f.amount_usd
+  FROM warehouse.fact_deposits f JOIN warehouse.dim_client c USING (client_key)
+  WHERE f.source_system = 'internal'

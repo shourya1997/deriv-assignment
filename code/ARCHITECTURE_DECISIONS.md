@@ -609,3 +609,88 @@ failures, so this corner-cut is latent everywhere except vendor_deposits today. 
 (per-row exclusion) is real future work if this prototype's DQ story needs to move from "detect and
 audit" to "detect and prevent bad rows reaching the warehouse," and would need `layer3_warehouse.py`
 changes, not just `dq.py` changes.
+
+## ADR-13 — Step 9: config-declared-SQL reconciliation, `dq_table_health` reuse, and no cross-DAG sensor
+
+**Decision:** `ReconciliationConfig`'s `left`/`right` are each a complete SQL SELECT statement
+(returning the `key` columns, in order) rather than a table name + predicate the engine joins
+generically. `run_reconciliation` diffs the two key sets and reuses `dq.log_check` (Step 8,
+unchanged) to get `dq_table_health` regression coverage. The generated `reconcile_vendor_feed` DAG
+has no sensor gating it on the table DAGs having run first.
+
+**Why config-declared SQL, not generic join construction:** the Step 2 stub had `left`/`right` as
+bare table names and `key` as a single string (`deposit_id`) — a schema that looks more "generic"
+but was never actually exercisable: vendor deposit IDs are `VDEP###`, internal are `DEP###`,
+disjoint namespaces that would never match on that key. The real semantics need a 3-column
+composite key (`client_id`, `deposit_date`, `amount_usd`) and a join out to `dim_client` for
+`client_id` (`fact_deposits` only has the surrogate `client_key`) — building a generic
+table+predicate+join-construction mechanism in the engine for a design with exactly one real
+config instance would be speculative machinery with no second caller to prove it's actually
+generic. Reusing Step 8's `dq_checks` convention ("the config declares the SQL, the engine just
+runs it and diffs/logs the result") is the same trade-off already made and accepted in that phase,
+now applied a second time.
+
+**Why `log_check` reuse, not a `dq_table_health` change:** `part1_pipeline.md` states
+reconciliation discrepancies are "surfaced in the `dq_table_health` view... as a per-table health
+signal," but the view (migration 008, unmodified since Step 8) only ever reads
+`data_quality.dq_check_results`, grouped by `(table_name, run_id)`. Rather than adding new
+plumbing or changing the view's shape, `run_reconciliation` calls the existing
+`dq.log_check(conn, run_id, cfg.name, f"reconciliation:{cfg.name}", "WARNING", ...)` — using the
+reconciliation's own `name` ("vendor_feed") as `table_name` gives it a health-tracking line "for
+free" with zero changes to Step 8's already-committed code. The trade-off (flagged in dual review,
+Sonnet): `table_name` is now a namespace shared between real tables and reconciliations with no
+collision guard beyond `validate_all()`'s new duplicate-name check (added this phase) — acceptable
+since nothing shipped collides, and a collision is now a loud config-validation error rather than
+a silent regression-bucket merge.
+
+**Why no cross-DAG sensor:** Steps 5/6 each added a `PythonSensor` (`requires_dim_instrument`,
+`requires_scd2_baseline`) because those DAGs have a *hard* prerequisite — a missing FK target
+means an unrecoverable crash, not just a stale report. Reconciliation's prerequisite is softer: an
+early run against an empty or half-loaded `fact_deposits` just reports "nothing" or "everything,"
+self-correcting on the next scheduled run with no data corruption risk. `scripts/verify.sh`'s own
+DAG-test ordering (`bootstrap_warehouse → table__* → reconcile_vendor_feed →
+cdc_historical_reload`) already matches the plan's stated verification order, so test-time
+correctness doesn't require an additional data-condition poll. Both reviewers treated this as a
+defensible judgment call for a non-blocking reporting job in this prototype, not a bug — flagged
+for awareness, not fixed.
+
+**Dual review findings, all applied:**
+- **Non-idempotent re-run under the same `run_id` (both reviewers, highest confidence)** —
+  `run_reconciliation` only ever `INSERT`ed into `reconciliation_discrepancies`; `airflow dags
+  test <dag> <date>` derives a deterministic `run_id` from the execution date, so `verify.sh`'s
+  own new "run twice for idempotency" block silently doubled every discrepancy row (and the
+  `dq_check_results` row) under the same `run_id`. Fixed with a `DELETE ... WHERE
+  reconciliation_name = %s AND run_id = %s` immediately before the insert loop, inside the same
+  transaction — the same "make a rerun a true no-op" shape as every layer1-3 `ON CONFLICT` upsert
+  already in this codebase, just expressed as delete-then-insert since discrepancy rows have no
+  natural per-row conflict target of their own.
+- **`left`/`right` accepted any YAML value including `None` (both reviewers)** — only key
+  *presence* was validated, not type, unlike every other risky field in `config.py` (the file's
+  own stated rationale: fail loud at config-load time, not with an opaque runtime error). Fixed
+  with an explicit `isinstance(..., str)` check in `ReconciliationConfig.load()`.
+- **`load_all()` silently returned `[]` for a missing `config/reconciliations` directory (Opus)**
+  — the exact "fake 0-configs success" shape `_load_all_table_dir`/`validate_all` already exist
+  to prevent for the table-configs case (Step 2 finding, documented in their own docstrings). A
+  vanished bind mount would give a green `--validate-all` and silently stop reconciliation
+  forever. Fixed to raise, matching the table-dir loader.
+- **No name-collision guard between table configs and reconciliation configs (Sonnet)** — see the
+  `dq_table_health` reuse trade-off above. Fixed: `validate_all()` now raises on any name
+  duplicated across the two config sets.
+- **Set-based key comparison collapses duplicate key tuples (Opus)** — `_key_tuples` returns a
+  `set`, so a double-posted vendor deposit (same client/date/amount, different `deposit_id`)
+  reconciles clean instead of flagging a multiplicity mismatch. No shipped data exercises this
+  (confirmed: 22 vendor / 20 internal rows, no duplicate key tuples on either side). Marked as a
+  deliberate `# ponytail:` corner-cut in `reconcile.py` rather than rewritten to a
+  `collections.Counter`-based multiset diff, since no test or shipped config needs it yet and the
+  upgrade is a self-contained, later change to `_key_tuples` alone.
+
+**Not fixed, judged acceptable:** a `key`-list-vs-SELECT-column *order* mismatch (as opposed to a
+count mismatch, which `zip(..., strict=True)` already catches) is unvalidated — it would silently
+mislabel `natural_key` jsonb with no runtime signal (Opus). Building generic validation for this
+would mean parsing or introspecting the config's own arbitrary SQL to confirm column order, which
+is disproportionate machinery for a one-instance config; the contract is documented in
+`ReconciliationConfig`'s own docstring instead. Also not fixed: `dq_check_results` rows duplicate
+on a same-`run_id` re-run for *table* DQ checks too (Sonnet) — but `dq.log_check` itself is
+unchanged Step 8 code, already exercised by every `table__*` DAG's existing run-twice block in
+`verify.sh` before this phase; not a regression Step 9 introduced, and out of this phase's scope
+to fix retroactively.

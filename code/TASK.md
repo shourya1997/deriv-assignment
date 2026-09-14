@@ -12,7 +12,7 @@ Full spec: `/Users/shouryasengupta/.claude/plans/compiled-wobbling-quilt.md`.
 - [x] Step 6 — add client_profile_changes.yml (scd2_apply / CDC)
 - [x] Step 7 — historical reload (cdc_historical_reload DAG)
 - [x] Step 8 — Great Expectations (one real suite) + SQL-assertion DQ for the rest
-- [ ] Step 9 — reconciliation (vendor_feed)
+- [x] Step 9 — reconciliation (vendor_feed)
 - [ ] Step 10 — DAG factory completeness + auto-generation guardrail tests
 - [ ] Step 11 — docs (code/README.md, root README.md status, CLAUDE.md note)
 

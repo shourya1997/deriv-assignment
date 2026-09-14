@@ -426,34 +426,45 @@ def _load_all_table_dir() -> list[object]:
 
 @dataclass
 class ReconciliationConfig:
+    """Step 9: `left`/`right` are each a complete SQL SELECT returning the
+    `key` columns, in that order, for one source's rows (e.g. vendor-feed vs.
+    internal-portal deposits, both living in `warehouse.fact_deposits` but
+    needing a join out to `dim_client` for `client_id` — per
+    part1_pipeline.md section 3). Declaring full queries (not just a table +
+    predicate) reuses Step 8's dq_checks pattern of config-declared SQL
+    rather than teaching the engine to build joins generically for a design
+    with exactly one real instance. A key tuple returned by one side and not
+    the other is a discrepancy — nothing beyond tuple presence is compared,
+    since the key itself (client_id, deposit_date, amount_usd) already
+    carries every value that has to agree."""
+
     name: str
+    key: list[str]
     left: str
     right: str
-    key: str
-    compare_columns: list[str]
 
     @classmethod
     def load(cls, path: Path) -> "ReconciliationConfig":
         path = Path(path)
         raw = _load_yaml(path)
         try:
-            return cls(
-                name=raw["name"],
-                left=raw["left"],
-                right=raw["right"],
-                key=raw["key"],
-                compare_columns=_require_str_list(
-                    raw, "compare_columns", path, required=False
-                ),
-            )
+            key = _require_str_list(raw, "key", path, required=True)
+            left, right = raw["left"], raw["right"]
         except KeyError as exc:
             raise ValueError(f"{path}: missing required key {exc}") from exc
+        if not isinstance(left, str) or not isinstance(right, str):
+            raise ValueError(f"{path}: left and right must be SQL strings, got {left!r}/{right!r}")
+        return cls(name=raw["name"], key=key, left=left, right=right)
 
     @classmethod
     def load_all(cls) -> list["ReconciliationConfig"]:
+        # No silent-zero here either (see _load_all_table_dir's docstring for
+        # the original version of this bug): a vanished config/reconciliations
+        # bind mount must fail validate_all, not just quietly stop scheduling
+        # reconciliation forever.
         recon_dir = CONFIG_DIR / "reconciliations"
         if not recon_dir.is_dir():
-            return []
+            raise ValueError(f"{recon_dir}: config/reconciliations directory does not exist")
         return [cls.load(path) for path in sorted(recon_dir.glob("*.yml"))]
 
 
@@ -485,6 +496,13 @@ def validate_all() -> list[str]:
                           f" and the bind mount before trusting this as a real 'zero tables'")
     validated = [cfg.name for cfg in table_dir_configs]
     validated += [cfg.name for cfg in ReconciliationConfig.load_all()]
+    dupes = {name for name in validated if validated.count(name) > 1}
+    if dupes:
+        # table_name (dq_check_results/dq_table_health) is shared across
+        # table configs and reconciliation configs — a name collision would
+        # silently merge two unrelated check populations into one regression
+        # bucket (Step 9 dual review finding, Sonnet).
+        raise ValueError(f"duplicate config name(s) across tables/reconciliations: {sorted(dupes)}")
     return validated
 
 

@@ -593,3 +593,86 @@ ADR-9's lesson). Confirmed findings fixed:
     reverted to the non-raising, log+quarantine-only design with the `# ponytail:`-documented
     corner-cut instead. Not a reviewer-caught bug; a design conflict I found myself while verifying
     the reviewers' own suggested fix against the project's own hard gate.
+
+## Step 9 — reconciliation (vendor_feed)
+
+- Redesigned the Step 2 `ReconciliationConfig` stub (`name`/`left`/`right`/`key`/
+  `compare_columns`, `left`/`right` bare table names, `key` a single string) — that schema never
+  matched real semantics, since vendor (`VDEP###`) and internal (`DEP###`) deposit IDs are
+  disjoint namespaces. New shape: `name: str`, `key: list[str]`, `left: str`, `right: str`, where
+  `left`/`right` are each a complete SQL SELECT returning the `key` columns, in order, for one
+  source — reuses Step 8's `dq_checks` convention of config-declared SQL rather than teaching the
+  engine generic join construction for a design with exactly one real instance.
+- New `deriv_pipeline/recon/reconcile.py`: `run_reconciliation(cfg, conn, run_id)` reads both
+  sides via `cfg.left`/`cfg.right`, diffs key sets in both directions (`missing_right`/
+  `missing_left`), writes each discrepancy to the pre-existing (gap-fill migration 009)
+  `data_quality.reconciliation_discrepancies`, and reuses `dq.log_check` (Step 8) with
+  `table_name=cfg.name` to get `dq_table_health` regression coverage "for free" — zero changes to
+  Step 8's already-committed code or the view, per `part1_pipeline.md`'s claim that reconciliation
+  is "surfaced in the dq_table_health view."
+- New real config `config/reconciliations/vendor_feed.yml`: both sides join `fact_deposits` to
+  `dim_client` (for `client_id` — `fact_deposits` only has the surrogate `client_key`), filtered
+  by `source_system = 'vendor'`/`'internal'`.
+- Wired into `dags/dag_factory.py` via the same generation pattern as the table-DAG loop:
+  `ReconciliationConfig.load_all()` → one `reconcile_{name}` DAG per config, single task calling
+  `reconcile.run_reconciliation`, reusing Airflow's own `context["run_id"]` exactly like
+  `_run_dq_checks`. **Deliberately no cross-DAG sensor** gating this on the table DAGs having run
+  first (unlike `requires_dim_instrument`/`requires_scd2_baseline`) — `scripts/verify.sh`'s own
+  DAG-test ordering already runs `bootstrap_warehouse → table__* → reconcile_vendor_feed →
+  cdc_historical_reload`, matching the plan's stated verification order; judged unrequested
+  complexity for a non-blocking reporting job in this prototype (both reviewers treated this as a
+  defensible judgment call, not a bug).
+- `tests/integration/test_reconciliation.py`: the real risk here (stated explicitly in the plan)
+  is that vendor and internal deposits share **zero** natural-key matches in the shipped data, so
+  "discrepancies is non-empty" alone would pass even for a broken engine. The real test instead
+  asserts the exact symmetric difference recomputed independently from the DB (not from `cfg.left`/
+  `cfg.right` themselves, to avoid a tautological test), plus a positive control: clone one real
+  internal row into a matching vendor row and assert it's correctly excluded — which also shifts
+  the expected discrepancy count by exactly one (my first draft's `expected = |vendor|+|internal|`
+  computed *before* the clone was off by one; fixed by recomputing `vendor_keys ^ internal_keys`
+  *after* the clone, and by asserting each `by_type` count against the correct set difference, not
+  the full side's count).
+- Full suite: 113/113 passing. `scripts/verify.sh`: PASS end-to-end, including a new
+  `reconcile_vendor_feed` run-twice block between the `table__*` loop and `cdc_historical_reload`.
+
+**Dual review (Opus + Sonnet)**, both directly against the repo (no `isolation: worktree`, per
+ADR-9's lesson). Both independently converged on the same idempotency bug; each also found
+issues the other didn't. **All applied fixes below**, see ARCHITECTURE_DECISIONS.md ADR-13 for
+full detail:
+  - **Non-idempotent re-run under the same run_id (both reviewers, highest confidence — and
+    demonstrated live by `verify.sh`'s own new idempotency block)** — `run_reconciliation` only
+    ever INSERTed; `airflow dags test <dag> 2024-03-01` derives a deterministic run_id from the
+    execution date, so the "run 2, idempotency" block in `verify.sh` silently doubled every
+    discrepancy row (and the `dq_check_results` row) under the same run_id, with nothing
+    asserting row counts to catch it. Fixed: `run_reconciliation` now `DELETE`s any existing
+    `(reconciliation_name, run_id)` rows before inserting this run's discrepancies.
+  - **`left`/`right` accepted any YAML value, including `None` (both reviewers)** — only presence
+    was checked, not type; a malformed/empty `left:` value passed `--validate-all` cleanly and
+    only surfaced as an opaque `psycopg`/`TypeError` inside the Airflow task. Fixed:
+    `ReconciliationConfig.load()` now raises `ValueError` naming the path if `left`/`right` aren't
+    strings, matching every other risky field in `config.py`.
+  - **`ReconciliationConfig.load_all()` silently returned `[]` for a missing directory (Opus)** —
+    reintroduced the exact "fake 0-configs success" bug `_load_all_table_dir`/`validate_all`'s own
+    docstrings cite as a prior fix (Step 2); a vanished `config/reconciliations` bind mount would
+    give a green `--validate-all` and silently stop reconciliation forever. Fixed: now raises,
+    matching the table-dir loader's fail-fast behavior.
+  - **No cross-directory name-collision guard between table configs and reconciliation configs
+    (Sonnet)** — `log_check` writes into `dq_check_results.table_name` using `cfg.name`, and that
+    column is shared with real tables; nothing stopped a future reconciliation config from sharing
+    a name with a table config, silently merging their `dq_table_health` regression buckets.
+    Fixed: `validate_all()` now raises on any duplicate name across both.
+  - **Set-based key comparison collapses duplicate key tuples (Opus)** — a double-posted vendor
+    deposit (same client/date/amount, different `deposit_id`) reconciles clean instead of flagging
+    a multiplicity mismatch, since `_key_tuples` returns a `set`. No shipped data exercises this
+    (verified: 22 vendor / 20 internal rows, no duplicate key tuples either side). Documented as a
+    deliberate `# ponytail:` corner-cut in `reconcile.py` rather than rewritten to a
+    `collections.Counter`-based multiset diff — upgrade path named in the comment.
+- **Not fixed, judged acceptable**: `key`-list-vs-SELECT-column-order mismatch is unvalidated
+  beyond `zip(..., strict=True)`'s count check (Opus) — an order mismatch (not a count mismatch)
+  would silently mislabel `natural_key` jsonb with no runtime signal; the column-order contract is
+  already documented in `ReconciliationConfig`'s docstring, and building generic validation for it
+  would mean parsing/introspecting the config's own arbitrary SQL — judged out of scope for a
+  one-instance config. `dq_check_results` duplicating on a same-run_id re-run for *table* DQ
+  checks (Sonnet, noted as pre-existing) — `dq.log_check` itself is unchanged, insert-only Step 8
+  code already exercised by every `table__*` DAG's existing run-twice block in `verify.sh`; not a
+  regression introduced by Step 9, out of this phase's scope.

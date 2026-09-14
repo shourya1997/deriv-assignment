@@ -136,8 +136,9 @@ def test_parses_reconciliation_config():
 
     cfg = ReconciliationConfig.load(FIXTURES / "reconciliation.yml")
     assert cfg.name == "vendor_feed"
-    assert cfg.left == "staging.vendor_deposits"
-    assert cfg.right == "staging.client_deposit"
+    assert cfg.key == ["client_id", "deposit_date", "amount_usd"]
+    assert cfg.left == "SELECT client_id, deposit_date, amount_usd FROM staging.vendor_deposits"
+    assert cfg.right == "SELECT client_id, deposit_date, amount_usd FROM staging.client_deposit"
 
 
 def test_all_shipped_configs_validate():

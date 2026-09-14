@@ -6,6 +6,8 @@ Airflow's standard dynamic-DAG pattern (loop at module scope, register into
 per-table divergence lives here. `run_dq_checks` dispatches to
 `deriv_pipeline.dq.run_dq_checks` (Step 8): the one real GE suite for
 vendor_deposits, config-declared SQL assertions for every other table.
+`ReconciliationConfig.load_all()` generates one further DAG per entry (Step
+9), a single task calling `deriv_pipeline.recon.reconcile.run_reconciliation`.
 
 Two DAGs stay hand-authored (bootstrap_warehouse, cdc_historical_reload) for
 reasons documented in ARCHITECTURE_DECISIONS.md ADR-1 — this file never
@@ -19,9 +21,10 @@ from airflow.operators.python import PythonOperator
 from airflow.sensors.python import PythonSensor
 
 from deriv_pipeline import dq
-from deriv_pipeline.config import TableConfig
+from deriv_pipeline.config import ReconciliationConfig, TableConfig
 from deriv_pipeline.db import get_connection
 from deriv_pipeline.layers import layer1_raw, layer2_staging, layer3_warehouse
+from deriv_pipeline.recon import reconcile
 
 
 def _run(fn, cfg):
@@ -160,5 +163,28 @@ def _make_dag(cfg: TableConfig) -> DAG:
     return dag
 
 
+def _run_reconciliation(cfg, **context):
+    _run(lambda c, conn: reconcile.run_reconciliation(c, conn, context["run_id"]), cfg)
+
+
+def _make_reconciliation_dag(cfg: ReconciliationConfig) -> DAG:
+    with DAG(
+        dag_id=f"reconcile_{cfg.name}",
+        schedule="@daily",
+        start_date=datetime.fromisoformat("2024-01-01"),
+        catchup=False,
+        tags=["reconciliation"],
+    ) as dag:
+        PythonOperator(
+            task_id="run_reconciliation",
+            python_callable=_run_reconciliation,
+            op_kwargs={"cfg": cfg},
+        )
+    return dag
+
+
 for _cfg in TableConfig.load_all(kind="table"):
     globals()[f"table__{_cfg.name}"] = _make_dag(_cfg)
+
+for _rcfg in ReconciliationConfig.load_all():
+    globals()[f"reconcile_{_rcfg.name}"] = _make_reconciliation_dag(_rcfg)
