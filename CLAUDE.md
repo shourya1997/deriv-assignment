@@ -38,3 +38,7 @@ original brief.
   exercises the actual `sql/` schema against `data/` via Airflow DAGs, not a reimplementation;
   its own `code/TASK.md`/`code/PROGRESS.md`/`code/ARCHITECTURE_DECISIONS.md` are the source of
   truth for its build history — read those before making further `code/` changes.
+- `code/README.md` is the full onboarding doc for the prototype: local run instructions,
+  a table/dimension/reconciliation/DQ config-authoring guide, Mermaid architecture diagrams,
+  and a code-flow walkthrough — update it alongside any change to `config.py`'s schema,
+  `dag_factory.py`'s generation logic, or `dq.py`'s check dispatch, so it doesn't drift.
